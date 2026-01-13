@@ -16,8 +16,8 @@ import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 #%%
 
-CF_wind_path = os.path.expanduser('./../Results/CF_wind/')
-CF_solar_path = os.path.expanduser('./../Results/CF_solar/')
+CF_wind_path = os.path.expanduser('./Results/CF_wind/')
+CF_solar_path = os.path.expanduser('./Results/CF_solar/')
 
 CF_wind_file = os.listdir(CF_wind_path)
 
@@ -42,8 +42,11 @@ fig, ax = plt.subplots(figsize=(12,8))
 sns.histplot(CF_wind_dly.values.flatten(), bins=50,ax=ax, label = 'CF wind', fill = True, color = 'royalblue', alpha = 0.5)
 plt.title('Daily CF_wind empirical distribution')
 ax.set_xlabel('CF_wind')
+plt.show()
 
 fig, ax = plt.subplots(figsize=(12,8))
 sns.histplot(CF_solar_dly.values.flatten(), bins=30, ax=ax, label = 'Solar', fill = True, color = 'gold', alpha = 0.5)
 plt.title('Daily (daytime) CF_solar empirical distribution')
+plt.show()
 
+# %%
