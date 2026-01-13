@@ -1,0 +1,26 @@
+# Pythoncat > .gitignore << 'EOF'
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+venv/
+
+# IDE/editor
+.vscode/
+.idea/
+*.swp
+
+# Jupyter notebooks checkpoints
+.ipynb_checkpoints/
+
+# Data and large outputs
+Data/
+Results/
+Figures/
+
+# OS-specific
+.DS_Store
+EOF

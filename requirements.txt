@@ -1,0 +1,10 @@
+xarray
+numpy
+pandas
+matplotlib
+seaborn
+cartopy
+geopandas
+regionmask
+scipy
+cdsapi
