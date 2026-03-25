@@ -16,8 +16,8 @@ import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 #%%
 
-CF_wind_path = os.path.expanduser('./Results/CF_wind/')
-CF_solar_path = os.path.expanduser('./Results/CF_solar/')
+CF_wind_path = os.path.expanduser('./../Results/CF_wind/')
+CF_solar_path = os.path.expanduser('./../Results/CF_solar/')
 
 CF_wind_file = os.listdir(CF_wind_path)
 

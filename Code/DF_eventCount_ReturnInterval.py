@@ -252,7 +252,7 @@ def decluster_events(CF_sys, threshold, duration, min_gap):
 #%%Run the decluster function on CF dataset
 # parameters for empirical analysis 
 X = 0.05
-duration = 3
+duration = 1
 min_gap = 1
 
 DF_events = decluster_events(
