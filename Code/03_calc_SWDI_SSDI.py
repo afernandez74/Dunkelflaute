@@ -71,71 +71,40 @@ import seaborn as sns
 
 
 #%%
-# ─── Load hourly CF datasets ──────────────────────────────────────────────────
+# ─── Load daily CF datasets ───────────────────────────────────────────────────
 #
-# CF_wind and CF_solar were produced by calc_CF_wind.py / calc_CF_solar.py
-# (CDS-downloaded data) or by the ARCO-ERA5 pipeline once available.
-# Each file is a DataArray of hourly capacity factors (dims: time, lat, lon).
-
-CF_wind_path  = Path('./../Results/CF_wind/')
-CF_solar_path = Path('./../Results/CF_solar/')
-
-CF_wind_file  = sorted(CF_wind_path.glob('*.nc'))[0]
-CF_solar_file = sorted(CF_solar_path.glob('*.nc'))[0]
-
-print(f"Loading wind CF  : {CF_wind_file.name}")
-print(f"Loading solar CF : {CF_solar_file.name}")
-
-CF_wind_hr  = xr.open_dataarray(CF_wind_file)
-CF_solar_hr = xr.open_dataarray(CF_solar_file)
-
-# Normalise the time dimension name to 'time' throughout the pipeline.
-# CDS-downloaded files carry 'valid_time'; ARCO-ERA5 files carry 'time'.
-for label, da in [('wind', CF_wind_hr), ('solar', CF_solar_hr)]:
-    if 'valid_time' in da.dims:
-        print(f"  Renaming 'valid_time' → 'time' in CF_{label}")
-CF_wind_hr  = CF_wind_hr.rename({'valid_time': 'time'}) if 'valid_time' in CF_wind_hr.dims  else CF_wind_hr
-CF_solar_hr = CF_solar_hr.rename({'valid_time': 'time'}) if 'valid_time' in CF_solar_hr.dims else CF_solar_hr
-
-print(f"\nWind  CF — shape: {CF_wind_hr.shape}")
-print(f"  time: {str(CF_wind_hr.time.values[0])[:10]} → {str(CF_wind_hr.time.values[-1])[:10]}")
-print(f"Solar CF — shape: {CF_solar_hr.shape}")
-print(f"  time: {str(CF_solar_hr.time.values[0])[:10]} → {str(CF_solar_hr.time.values[-1])[:10]}")
-
-
-#%%
-# ─── Daily aggregation ────────────────────────────────────────────────────────
+# Daily capacity factors were pre-computed by 02_calc_CF_daily.py and saved as
+# consolidated Zarr stores.  Three aggregates are available:
 #
-# Wind: daily mean over all 24 h (turbines run continuously).
+#   CF_wind_dly           — 24-hour mean wind CF (turbines run continuously)
+#   CF_solar_24h_dly      — 24-hour mean solar CF (including nighttime zeros)
+#                           ← used here as SSDI input
+#   CF_solar_daytime_dly  — daylight-only mean solar CF (CF > 0 hours)
+#                           ← used in 04_DF_ID.py for delta optimisation
 #
-# Solar (24h mean): mean over all 24 h including nighttime zeros.  This is
-#   the input to SSDI; the DOY standardisation handles the seasonal day-length
-#   variation (see module docstring).
-#
-# Solar (daytime mean): mean restricted to hours when CF_solar > 0, i.e. when
-#   the panels are actually producing power.  Saved for the delta-optimisation
-#   in 04_DF_ID.py.  Days with no generating hours (e.g. high-latitude winter)
-#   become NaN, which is expected.
+# The 24h solar mean is the correct SSDI input: the DOY climatology encodes
+# the seasonal day-length structure, so the standardised anomaly expresses
+# "how far below the expected daily generation is this day?" relative to a
+# climatological baseline that itself includes the structural night zeros
+# (Van der Wiel et al. 2019).
 
-print("Computing daily CF aggregates ...")
+CF_daily_dir = Path('./../Results/CF_daily')
 
-CF_wind_dly        = CF_wind_hr.resample(time='1D').mean()
-CF_solar_24h_dly   = CF_solar_hr.resample(time='1D').mean()
+CF_wind_dly          = xr.open_zarr(CF_daily_dir / 'CF_wind_daily.zarr',
+                                     consolidated=True, chunks={})['CF_wind_dly']
+CF_solar_24h_dly     = xr.open_zarr(CF_daily_dir / 'CF_solar_24h_daily.zarr',
+                                     consolidated=True, chunks={})['CF_solar_24h_dly']
+CF_solar_daytime_dly = xr.open_zarr(CF_daily_dir / 'CF_solar_daytime_daily.zarr',
+                                     consolidated=True, chunks={})['CF_solar_daytime_dly']
 
-# Daytime-only mask: keep hours where solar panels are generating (CF_solar > 0)
-CF_solar_daytime_dly = (
-    CF_solar_hr
-    .where(CF_solar_hr > 0)        # set nighttime hours to NaN
-    .resample(time='1D').mean()    # mean over generating hours; NaN if none
-)
-CF_solar_daytime_dly.name = 'CF_solar_daytime'
-
-print(f"  CF_wind daily        — shape: {CF_wind_dly.shape}")
-print(f"  CF_solar 24h daily   — shape: {CF_solar_24h_dly.shape}")
-print(f"  CF_solar daytime dly — shape: {CF_solar_daytime_dly.shape}")
+print(f"Loaded daily CFs from {CF_daily_dir}")
+print(f"  CF_wind_dly          — shape: {CF_wind_dly.shape}")
+print(f"  CF_solar_24h_dly     — shape: {CF_solar_24h_dly.shape}")
+print(f"  CF_solar_daytime_dly — shape: {CF_solar_daytime_dly.shape}")
+print(f"  time: {str(CF_wind_dly.time.values[0])[:10]} → {str(CF_wind_dly.time.values[-1])[:10]}")
 print(f"  Daytime NaN fraction: "
-      f"{float(CF_solar_daytime_dly.isnull().mean().values)*100:.1f}%  "
-      f"(expected ~40-50% in Netherlands region)")
+      f"{float(CF_solar_daytime_dly.isnull().mean().compute().values)*100:.1f}%  "
+      f"(expected ~40–50% in Netherlands / NW Europe region)")
 
 
 #%%
