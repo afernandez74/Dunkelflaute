@@ -21,7 +21,7 @@
 # Each array task downloads one calendar year of:
 #   u10, v10, u100, v100, ssrd, t2m
 # for the extended European domain [N57, W8, S39, E19] and saves a compressed
-# NetCDF file to $ERA5_dat/temps_df/era5_<YEAR>.nc
+# NetCDF file to $ERA5_dat/df_dat/era5_<YEAR>.nc
 #
 # Memory note: 6 variables × ~96 lon pts × ~73 lat pts × 8760 h ≈ 2.4 GB raw
 # float32 per year; 64 GB allows comfortable dask overhead and multi-threading.
@@ -50,7 +50,7 @@ mamba activate CE_env
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ERA5_dat is inherited from ~/.bashrc via --export=ALL
-# The Python script will create $ERA5_dat/temps_df/ automatically.
+# The Python script will create $ERA5_dat/df_dat/ automatically.
 
 mkdir -p "$SCRIPT_DIR/logs"
 mkdir -p "$ERA5_dat"
@@ -65,7 +65,7 @@ echo "SLURM job:    $SLURM_JOB_ID"
 echo "Array task:   $SLURM_ARRAY_TASK_ID  (year)"
 echo "Node:         $SLURMD_NODENAME"
 echo "Script dir:   $SCRIPT_DIR"
-echo "Output dir:   $ERA5_dat/temps_df"
+echo "Output dir:   $ERA5_dat/df_dat"
 echo "Start:        $(date)"
 echo "========================================"
 

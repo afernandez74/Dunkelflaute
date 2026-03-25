@@ -30,21 +30,11 @@ Short-name lookup (fallback if 'short_name' attribute is missing)
   surface_solar_radiation_downwards → ssrd
   2m_temperature                    → t2m
 
-Note on ssrd units
-------------------
-In ARCO-ERA5, surface_solar_radiation_downwards is stored as accumulated
-energy in J/m² per hourly analysis step.  The existing capacity_factors.py
-module already handles the conversion to W/m² (divides by 3600 s), so no
-unit transform is applied here.
-
 Environment
 -----------
-  ERA5_dat   — base directory; script reads from $ERA5_dat/temps_df/
-               and writes to $ERA5_dat/temps_df/processed/
+  ERA5_dat   — base directory; script reads from $ERA5_dat/df_dat/
+               and writes to $ERA5_dat/df_dat/processed/
 
-Usage
------
-  python 00b_ETL_nc_to_zarr.py
 """
 
 import os
@@ -64,8 +54,8 @@ LAT_CHUNK = 10
 LON_CHUNK = 10
 
 # Subfolder under ERA5_dat that holds the raw annual NetCDF files
-# (must match OUTPUT_DIR in 00_dwnld_arco_era5.py)
-INPUT_FOLDER = "temps_df"
+# OUTPUT_DIR in 00_dwnld_arco_era5.py
+INPUT_FOLDER = "df_dat"
 
 # Fallback short-name map used when a variable's 'short_name' attribute is
 # absent.  Keys are ARCO-ERA5 long names; values are CF short names.
@@ -99,39 +89,38 @@ log = logging.getLogger(__name__)
 
 def convert_nc_to_zarr(folder_name: str, base_dir: Path) -> None:
     """
-    ETL: read all annual NetCDF files in *base_dir/folder_name*, apply
-    coordinate standardisation and variable renaming, re-chunk for time-series
-    access, and write a consolidated Zarr store to
-    *base_dir/folder_name/processed/<folder_name>_cleaned.zarr*.
+    Read all annual NetCDF files apply coordinate standardisation 
+    and variable renaming, re-chunk 
+    and write a Zarr store
 
     Parameters
     ----------
     folder_name : str
-        Subdirectory under base_dir that contains the raw *.nc files.
+        Subdirectory with the raw *.nc files.
     base_dir : Path
-        Root data directory (typically $ERA5_dat).
+        Root data directory
     """
     input_path  = Path(base_dir) / folder_name
     output_dir  = input_path / "processed"
     output_dir.mkdir(parents=True, exist_ok=True)
     zarr_path   = output_dir / f"{folder_name}_cleaned.zarr"
 
-    # ── 1. Discover files ────────────────────────────────────────────────────
+    # read files
     files = sorted(input_path.glob("*.nc"))
     if not files:
-        log.error("No .nc files found in %s — did 00_dwnld_arco_era5.py finish?", input_path)
+        log.error("No .nc files found in %s", input_path)
         return
 
     log.info("Found %d NetCDF file(s) in %s", len(files), input_path)
     log.info("Output Zarr store: %s", zarr_path)
 
-    # ── 2. Load (lazy) ───────────────────────────────────────────────────────
+    # load lazily
     log.info("Opening files with xr.open_mfdataset (parallel=True, lazy) …")
     ds = xr.open_mfdataset(
         files,
         combine="by_coords",
-        parallel=True,
-        chunks={},          # Defer chunking; we'll rechunk explicitly below
+        parallel=False,
+        chunks={},          
     )
     log.info(
         "Dataset loaded — variables: %s | time: %d steps | lat: %d | lon: %d",
@@ -141,7 +130,7 @@ def convert_nc_to_zarr(folder_name: str, base_dir: Path) -> None:
         ds.sizes.get("longitude", 0),
     )
 
-    # ── 3. Longitude wrap: [0, 360] → [−180, 180] ───────────────────────────
+    # Longitude wrap: [0, 360] → [−180, 180] 
     ds = ds.assign_coords(longitude=(ds.longitude + 180) % 360 - 180)
     ds = ds.sortby(["time", "latitude", "longitude"])
     log.info(
@@ -150,7 +139,7 @@ def convert_nc_to_zarr(folder_name: str, base_dir: Path) -> None:
         float(ds.longitude.max()),
     )
 
-    # ── 4. Variable renaming ─────────────────────────────────────────────────
+    # Variable renaming
     rename_dict: dict[str, str] = {}
     for var in ds.data_vars:
         # Prefer the 'short_name' attribute embedded in the file metadata
@@ -177,7 +166,7 @@ def convert_nc_to_zarr(folder_name: str, base_dir: Path) -> None:
             "processed": "00b_ETL_nc_to_zarr.py — dunkelflaute subproject",
         })
 
-    # ── 5. Re-chunk for time-series access ───────────────────────────────────
+    # Re-chunk for time-series access 
     # Full time axis per spatial tile: optimal for reading all hours at a
     # given grid cell (capacity-factor and event-detection workflows).
     ds = ds.chunk({"time": -1, "latitude": LAT_CHUNK, "longitude": LON_CHUNK})
@@ -186,7 +175,7 @@ def convert_nc_to_zarr(folder_name: str, base_dir: Path) -> None:
         LAT_CHUNK, LON_CHUNK,
     )
 
-    # ── 6. Write Zarr ────────────────────────────────────────────────────────
+    # Write Zarr
     log.info("Writing Zarr store (this may take several minutes) …")
     ds.to_zarr(zarr_path, mode="w", consolidated=True)
     log.info("Success ✓  Zarr store written to: %s", zarr_path)

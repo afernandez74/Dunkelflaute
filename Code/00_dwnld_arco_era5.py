@@ -34,7 +34,7 @@ Usage
 Environment
 -----------
   ERA5_dat   — base directory for output files (set in ~/.bashrc on HPC)
-               Downloaded NetCDF files are written to $ERA5_dat/temps_df/
+               Downloaded NetCDF files are written to $ERA5_dat/df_dat/
 """
 
 import argparse
@@ -77,7 +77,7 @@ YEAR_END   = 2024          # inclusive; script caps at last available date
 
 # Output directory — NetCDF files written here, one per year
 # Uses the same ERA5_dat env var as the 'ag' subproject, but a separate
-# subdirectory (temps_df) to avoid clashing with ag downloads.
+# subdirectory (df_dat) to avoid clashing with ag downloads.
 _ERA5_DAT = os.environ.get("ERA5_dat")
 if _ERA5_DAT is None:
     raise EnvironmentError(
@@ -85,7 +85,7 @@ if _ERA5_DAT is None:
         "Add it to ~/.bashrc, e.g.:\n"
         "  export ERA5_dat=/path/to/data/era5"
     )
-OUTPUT_DIR = os.path.join(_ERA5_DAT, "temps_df")
+OUTPUT_DIR = os.path.join(_ERA5_DAT, "df_dat")
 
 # ARCO-ERA5 Zarr store on Google Cloud Storage (public, no auth needed)
 ZARR_STORE = "gs://gcp-public-data-arco-era5/ar/full_37-1h-0p25deg-chunk-1.zarr-v3"
@@ -219,7 +219,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Download ARCO-ERA5 data for the dunkelflaute subproject.\n"
-            "Saves one compressed NetCDF file per year to $ERA5_dat/temps_df/."
+            "Saves one compressed NetCDF file per year to $ERA5_dat/df_dat/."
         )
     )
     parser.add_argument(
