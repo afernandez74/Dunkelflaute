@@ -8,40 +8,15 @@ produced by 01_calc_CF.py.
 
 Three daily aggregates are produced
 ------------------------------------
-  1. CF_wind_dly           — daily mean wind CF (simple 24-hour mean).
-                             Turbines generate continuously, so the 24h mean
-                             is the appropriate daily aggregate.
+1. CF_wind_dly — daily mean wind CF (simple 24-hour mean).
 
-  2. CF_solar_24h_dly      — daily mean solar CF averaged over all 24 hours,
-                             including the structural nighttime zeros.
-                             This is the input to SSDI in 03_calc_SWDI_SSDI.py.
-                             The DOY climatology computed there encodes the
-                             seasonal day-length structure, so the standardised
-                             anomaly correctly expresses "how much below the
-                             expected daily generation is this day?" relative
-                             to the climatological mean that already includes
-                             night zeros (Van der Wiel et al. 2019).
-
-  3. CF_solar_daytime_dly  — daily mean solar CF averaged only over hours when
+2. CF_solar_24h_dly      — daily mean solar CF averaged over all 24 hours,
+                             including nighttime zeros.
+                             
+3. CF_solar_daytime_dly  — daily mean solar CF averaged only over hours when
                              CF_solar > 0 (panels are actively generating).
                              NOT used as SSDI input; saved for the delta-
                              optimisation analysis in 04_DF_ID.py.
-                             At night δ_solar = 0 by definition, so asking
-                             "what is the optimal wind/solar mix?" is only
-                             meaningful during hours when both resources can
-                             simultaneously produce power.
-                             Days with no generating hours (e.g. polar winter)
-                             return NaN for this aggregate.
-
-Why separate the two solar aggregates?
----------------------------------------
-Including nighttime zeros in the 24h mean makes the effective annual-mean
-solar CF approximately 3–5× lower than wind CF.  If this 24h aggregate were
-used in the delta optimisation, the optimal δ_wind would collapse to ~1 (pure
-wind) simply because of the unit-mismatch, not because of the resource
-climatology.  The daytime-only aggregate answers the ecologically relevant
-question: "given that the sun is up and panels are generating, what is the
-optimal resource mix?"
 
 Inputs
 ------
@@ -54,16 +29,6 @@ Outputs
   ./../Results/CF_daily/CF_solar_24h_daily.zarr     — daily solar CF (24h)
   ./../Results/CF_daily/CF_solar_daytime_daily.zarr — daily solar CF (daytime)
 
-Next step
----------
-  03_calc_SWDI_SSDI.py  — loads CF_wind_daily and CF_solar_24h_daily to
-                          compute SWDI and SSDI via DOY standardisation
-
-References
-----------
-  Van der Wiel et al. (2019), doi:10.1088/1748-9326/ab31d3
-
-@author: afer
 """
 
 #%%
@@ -79,11 +44,11 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
+import dask
 
 
 #%%
-# ─── Load hourly CFs from Zarr ────────────────────────────────────────────────
-# Open lazily; the actual resampling computation is triggered further below.
+# Load hourly CFs from Zarr lazily
 
 CF_wind_zarr  = Path('./../Results/CF_wind/CF_wind_hrly.zarr')
 CF_solar_zarr = Path('./../Results/CF_solar/CF_solar_hrly.zarr')
@@ -91,7 +56,7 @@ CF_solar_zarr = Path('./../Results/CF_solar/CF_solar_hrly.zarr')
 print(f"Loading CF_wind  : {CF_wind_zarr}")
 print(f"Loading CF_solar : {CF_solar_zarr}")
 
-# Zarr stores were saved as Datasets by 01_calc_CF.py; extract DataArrays
+# Extract dataarrays
 CF_wind_hr  = xr.open_zarr(CF_wind_zarr,  consolidated=True, chunks={})['CF_wind']
 CF_solar_hr = xr.open_zarr(CF_solar_zarr, consolidated=True, chunks={})['CF_solar']
 
@@ -102,61 +67,53 @@ print(f"  time: {str(CF_solar_hr.time.values[0])[:10]} → {str(CF_solar_hr.time
 
 
 #%%
-# ─── Daily aggregation ────────────────────────────────────────────────────────
-# All three aggregations are built as lazy Dask graphs and then computed
-# together in a single xr.compute() call to maximise I/O efficiency.
-#
+# Daily aggregation 
 # Chunking strategy: rechunk to a large time block before resampling so that
-# each Dask task covers ~5 years of hourly data per spatial column.  After
-# computation we rechunk the daily output for time-series access (time=-1).
+# each Dask task covers ~5 years of hourly data per spatial column.  
 
-CHUNK_HOURLY = 43_800   # ~5 years of hourly data (8760 h/yr × 5)
+CHUNK_HOURLY = 8_760 # 1 year
+CHUNK_LAT = 10
+CHUNK_LON = 10
 
 # 1. Daily mean wind CF — 24-hour mean
 CF_wind_dly = (
     CF_wind_hr
-    .chunk({'time': CHUNK_HOURLY, 'latitude': -1, 'longitude': -1})
+    .chunk({'time': CHUNK_HOURLY, 'latitude': CHUNK_LAT, 'longitude': CHUNK_LON})
     .resample(time='1D')
     .mean()
 )
 
-# 2. Daily mean solar CF — 24-hour average (includes nighttime zeros)
-#    The day-length seasonality is encoded in the DOY climatology computed in
-#    03_calc_SWDI_SSDI.py, so the 24h mean is the correct SSDI input.
+# 2. Daily mean solar CF — 24-hour average 
 CF_solar_24h_dly = (
     CF_solar_hr
-    .chunk({'time': CHUNK_HOURLY, 'latitude': -1, 'longitude': -1})
+    .chunk({'time': CHUNK_HOURLY, 'latitude': CHUNK_LAT, 'longitude': CHUNK_LON})
     .resample(time='1D')
     .mean()
 )
 
 # 3. Daily mean solar CF — daytime hours only (CF_solar > 0)
-#    xr.where replaces nighttime hours (CF=0) with NaN; the subsequent daily
-#    mean then skips NaNs, giving the mean over generating hours only.
-#    Days where the sun never rises (e.g. high-latitude deep winter) return NaN.
 CF_solar_daytime_dly = (
     CF_solar_hr.where(CF_solar_hr > 0)
-    .chunk({'time': CHUNK_HOURLY, 'latitude': -1, 'longitude': -1})
+    .chunk({'time': CHUNK_HOURLY, 'latitude': CHUNK_LAT, 'longitude': CHUNK_LON})
     .resample(time='1D')
     .mean()
 )
 
 # Trigger all three computations in parallel
 print("\nTriggering Dask computation (this may take several minutes)…")
-CF_wind_dly, CF_solar_24h_dly, CF_solar_daytime_dly = xr.compute(
-    CF_wind_dly, CF_solar_24h_dly, CF_solar_daytime_dly
-)
+
+print("computing CF wind mean daily values...")
+CF_wind_dly          = CF_wind_dly.compute()
+print("computing CF solar mean daily values...")
+CF_solar_24h_dly     = CF_solar_24h_dly.compute()
+print("computing CF solar mean daytime-only values...")
+CF_solar_daytime_dly = CF_solar_daytime_dly.compute()
+
 print("Computation complete.")
 
 print(f"\n  CF_wind_dly          — shape: {CF_wind_dly.shape}")
 print(f"  CF_solar_24h_dly     — shape: {CF_solar_24h_dly.shape}")
 print(f"  CF_solar_daytime_dly — shape: {CF_solar_daytime_dly.shape}")
-
-# Report the fraction of NaN values in the daytime aggregate.
-# Expect ~40–50% NaN in the Netherlands region (night hours dominate in winter).
-nan_frac = float(CF_solar_daytime_dly.isnull().mean().values) * 100
-print(f"\n  Daytime NaN fraction: {nan_frac:.1f}%  "
-      f"(expected ~40–50% in Netherlands / NW Europe region)")
 
 # Attach metadata
 CF_wind_dly = CF_wind_dly.rename('CF_wind_dly')
@@ -184,11 +141,7 @@ CF_solar_daytime_dly.attrs.update({
 
 
 #%%
-# ─── Diagnostic: sample grid cell distributions ──────────────────────────────
-# Box-and-whisker + histogram for all three daily CF aggregates at the central
-# grid cell.  The key feature to check is the ratio of CF_solar_24h_dly to
-# CF_solar_daytime_dly — the daytime-only mean should be noticeably higher
-# (roughly 2–3× in NW Europe) because nighttime zeros are excluded.
+# Diagnostic: sample grid cell distributions 
 
 lat_idx = CF_wind_dly.sizes['latitude']  // 2
 lon_idx = CF_wind_dly.sizes['longitude'] // 2
@@ -242,12 +195,8 @@ plt.show()
 
 
 #%%
-# ─── Diagnostic: DOY seasonal cycle at central grid cell ─────────────────────
+# Diagnostic: DOY seasonal cycle at central grid cell 
 # Mean-year profiles (DOY mean ± 1 std) for each daily CF aggregate.
-# Left panel: wind — expected to show a modest winter peak.
-# Right panel: solar — 24h and daytime-only side-by-side.  The daytime-only
-# aggregate should be 2–3× higher than the 24h mean in summer and much higher
-# in winter, because the 24h mean is diluted by long winter nights.
 
 def doy_stats(da, max_doy=365):
     """Compute DOY mean and std for a 1-D daily time series (single grid cell)."""
@@ -302,10 +251,7 @@ plt.show()
 
 
 #%%
-# ─── Diagnostic: spatial maps of time-mean daily CFs ─────────────────────────
-# Three-panel map showing the spatial pattern of each daily CF aggregate,
-# averaged over the full record.  These are the spatial fingerprints of the
-# wind and solar resource climatology over the study domain.
+# Diagnostic: spatial maps of time-mean daily CFs 
 
 CF_wind_mean_map  = CF_wind_dly.mean(dim='time')
 CF_s24_mean_map   = CF_solar_24h_dly.mean(dim='time')
@@ -351,13 +297,10 @@ plt.show()
 
 
 #%%
-# ─── Save daily CFs to Zarr ──────────────────────────────────────────────────
+# Save daily CFs to Zarr 
 # Three separate Zarr stores — one per aggregate — consumed by
 # 03_calc_SWDI_SSDI.py (wind + solar 24h) and 04_DF_ID.py (solar daytime).
 # Rechunked to full time axis per spatial tile for efficient time-series reads.
-
-LAT_CHUNK = 10
-LON_CHUNK = 10
 
 out_dir = Path('./../Results/CF_daily')
 out_dir.mkdir(parents=True, exist_ok=True)
@@ -371,7 +314,7 @@ out_paths = {
 for name, (da, path) in out_paths.items():
     da_save = (
         da
-        .chunk({'time': -1, 'latitude': LAT_CHUNK, 'longitude': LON_CHUNK})
+        .chunk({'time': -1, 'latitude': CHUNK_LAT, 'longitude': CHUNK_LON})
         .to_dataset()   # wrap DataArray → Dataset for clean Zarr variable naming
     )
     print(f"Saving {name} → {path}")
@@ -382,4 +325,3 @@ print("\nAll daily CF Zarr stores saved successfully:")
 for name, (_, path) in out_paths.items():
     print(f"  {name}: {path}")
 
-print("\nNext step: run 03_calc_SWDI_SSDI.py to compute SWDI and SSDI.")

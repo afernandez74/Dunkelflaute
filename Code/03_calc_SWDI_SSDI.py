@@ -9,7 +9,7 @@ Deficit Index (SSDI) from the previously computed hourly capacity factor files.
 Scientific background
 ---------------------
 Both indices follow the deseasonalised z-score approach of Van der Wiel et al.
-(2019, Environ. Res. Lett., doi:10.1088/1748-9326/ab31d3):
+(2019, Environ. Res. Lett.):
 
     index_d = ( CF_d  −  µ(DOY_d) ) / σ(DOY_d)
 
@@ -71,56 +71,42 @@ import seaborn as sns
 
 
 #%%
-# ─── Load daily CF datasets ───────────────────────────────────────────────────
+# Load daily CF datasets 
 #
-# Daily capacity factors were pre-computed by 02_calc_CF_daily.py and saved as
-# consolidated Zarr stores.  Three aggregates are available:
-#
-#   CF_wind_dly           — 24-hour mean wind CF (turbines run continuously)
-#   CF_solar_24h_dly      — 24-hour mean solar CF (including nighttime zeros)
-#                           ← used here as SSDI input
-#   CF_solar_daytime_dly  — daylight-only mean solar CF (CF > 0 hours)
-#                           ← used in 04_DF_ID.py for delta optimisation
-#
-# The 24h solar mean is the correct SSDI input: the DOY climatology encodes
-# the seasonal day-length structure, so the standardised anomaly expresses
-# "how far below the expected daily generation is this day?" relative to a
-# climatological baseline that itself includes the structural night zeros
-# (Van der Wiel et al. 2019).
+# from 02_calc_CF_daily.py 
 
 CF_daily_dir = Path('./../Results/CF_daily')
 
+# Keep time contiguous; chunk only spatially
+CHUNKS = {'time': -1, 'latitude': 20, 'longitude': 20}
+
 CF_wind_dly          = xr.open_zarr(CF_daily_dir / 'CF_wind_daily.zarr',
-                                     consolidated=True, chunks={})['CF_wind_dly']
+                                     consolidated=True, chunks=CHUNKS)['CF_wind_dly']
 CF_solar_24h_dly     = xr.open_zarr(CF_daily_dir / 'CF_solar_24h_daily.zarr',
-                                     consolidated=True, chunks={})['CF_solar_24h_dly']
+                                     consolidated=True, chunks=CHUNKS)['CF_solar_24h_dly']
 CF_solar_daytime_dly = xr.open_zarr(CF_daily_dir / 'CF_solar_daytime_daily.zarr',
-                                     consolidated=True, chunks={})['CF_solar_daytime_dly']
+                                     consolidated=True, chunks=CHUNKS)['CF_solar_daytime_dly']
 
 print(f"Loaded daily CFs from {CF_daily_dir}")
 print(f"  CF_wind_dly          — shape: {CF_wind_dly.shape}")
 print(f"  CF_solar_24h_dly     — shape: {CF_solar_24h_dly.shape}")
 print(f"  CF_solar_daytime_dly — shape: {CF_solar_daytime_dly.shape}")
 print(f"  time: {str(CF_wind_dly.time.values[0])[:10]} → {str(CF_wind_dly.time.values[-1])[:10]}")
-print(f"  Daytime NaN fraction: "
-      f"{float(CF_solar_daytime_dly.isnull().mean().compute().values)*100:.1f}%  "
-      f"(expected ~40–50% in Netherlands / NW Europe region)")
-
 
 #%%
-# ─── Quick look at the daily distributions ────────────────────────────────────
-# Sanity check before computing indices: verify the CF distributions
-# look physically reasonable.
+# Daily distributions central cell
 
-# Central grid cell used for all single-point diagnostics throughout the script
-lat_idx = CF_wind_dly.latitude.size // 2
-lon_idx = CF_wind_dly.longitude.size // 2
-central_lat = float(CF_wind_dly.latitude.values[lat_idx])
-central_lon = float(CF_wind_dly.longitude.values[lon_idx])
+# Central NL grid cell used for all single-point diagnostics throughout the script
+# lat_idx = CF_wind_dly.latitude.size // 2
+# lon_idx = CF_wind_dly.longitude.size // 2
+# central_lat = float(CF_wind_dly.latitude.values[lat_idx])
+# central_lon = float(CF_wind_dly.longitude.values[lon_idx])
+central_lat = 52
+central_lon = 5
 print(f"\nDiagnostic grid cell: ({central_lat:.2f}°N, {central_lon:.2f}°E)")
 
-wind_cell  = CF_wind_dly.isel(latitude=lat_idx, longitude=lon_idx)
-solar_cell = CF_solar_24h_dly.isel(latitude=lat_idx, longitude=lon_idx)
+wind_cell  = CF_wind_dly.sel(latitude=central_lat, longitude=central_lon)
+solar_cell = CF_solar_24h_dly.sel(latitude=central_lat, longitude=central_lon)
 
 fig, axs = plt.subplots(1, 2, figsize=(12, 5))
 fig.suptitle(f'Daily CF distributions — ({central_lat:.2f}°N, {central_lon:.2f}°E)', fontsize=13)
@@ -138,7 +124,7 @@ axs[1].hist(solar_vals, bins=40, density=True, alpha=0.6, color='gold', edgecolo
 sns.kdeplot(solar_vals, ax=axs[1], color='darkorange')
 axs[1].set_xlabel('CF_solar (daily 24h mean)')
 axs[1].set_ylabel('Density')
-axs[1].set_title('Solar capacity factor (incl. nighttime zeros)')
+axs[1].set_title('Solar capacity factor')
 axs[1].text(0.97, 0.97, f'mean = {float(solar_cell.mean(skipna=True).values):.3f}',
             transform=axs[1].transAxes, ha='right', va='top', fontsize=10)
 
@@ -147,21 +133,17 @@ plt.show()
 
 
 #%%
-# ─── DOY climatology functions ────────────────────────────────────────────────
+# DOY climatology functions 
 
 def calculate_doy_climatology(cf_daily, baseline_start=None, baseline_end=None):
     """
-    Compute day-of-year (DOY) climatological mean and standard deviation of a
-    daily capacity factor field.
+    Compute day-of-year (DOY) climatological mean and standard deviation of CF.
 
     For each DOY (1–365/366) the mean µ(DOY) and standard deviation σ(DOY) are
     computed over all years in the baseline period and at every grid cell
     independently.  The results are indexed by integer DOY and are aligned back
     onto a full time series using .sel(doy=da.time.dt.dayofyear).
-
-    This is the deseasonalisation approach of Van der Wiel et al. (2019,
-    Environ. Res. Lett.).
-
+    
     Parameters
     ----------
     cf_daily       : xr.DataArray   dims: (time, latitude, longitude)
@@ -184,13 +166,11 @@ def calculate_doy_climatology(cf_daily, baseline_start=None, baseline_end=None):
         .assign_coords(doy=lambda x: x.time.dt.dayofyear)
     )
 
-    cf_mean_doy = cf_baseline.groupby('doy').mean('time')
-    cf_std_doy  = cf_baseline.groupby('doy').std('time')
+    cf_mean_doy = cf_baseline.groupby('doy').mean('time').compute()
+    cf_std_doy  = cf_baseline.groupby('doy').std('time').compute()
 
-    # Guard: near-zero σ causes division-by-zero artefacts. This occurs for
-    # solar CF in winter (all days have ~zero generation → σ ≈ 0) and for any
-    # grid cell with very low interannual variability.  Setting σ → NaN
-    # propagates NaN to the index cleanly rather than producing ±Inf spikes.
+    # Guard: near-zero σ causes division-by-zero 
+    # Setting σ → NaN propagates NaN to the index 
     cf_std_doy = xr.where(cf_std_doy > 1e-6, cf_std_doy, np.nan)
 
     return cf_mean_doy, cf_std_doy
@@ -223,8 +203,6 @@ def calculate_standardized_index(cf_daily, cf_mean_doy, cf_std_doy):
     cf_daily = cf_daily.assign_coords(doy=cf_daily.time.dt.dayofyear)
 
     # Map each time step to its DOY climatological statistics.
-    # sel(doy=cf_daily.doy) returns arrays with the same shape as cf_daily
-    # because cf_daily.doy is a DataArray of DOY values indexed by time.
     mean_aligned = cf_mean_doy.sel(doy=cf_daily.doy)
     std_aligned  = cf_std_doy.sel(doy=cf_daily.doy)
 
@@ -233,14 +211,12 @@ def calculate_standardized_index(cf_daily, cf_mean_doy, cf_std_doy):
 
 
 #%%
-# ─── Compute SWDI ─────────────────────────────────────────────────────────────
-#
+# Compute SWDI 
+
 # Standardized Wind Deficit Index:
 #   SWDI < 0    : wind generation below seasonal normal
-#   SWDI < −1.0 : moderate deficit  (~16th percentile) — initial event flag
-#   SWDI < −1.5 : severe deficit    (~7th  percentile) — severity filter
-#
-# Reference: Van der Wiel et al. (2019).
+#   SWDI < −1.0 : moderate deficit  (~16th percentile) 
+#   SWDI < −1.5 : severe deficit    (~7th  percentile) 
 
 print("Computing SWDI DOY climatology ...")
 wind_mean_doy, wind_std_doy = calculate_doy_climatology(CF_wind_dly)
@@ -251,9 +227,7 @@ SWDI.name = 'SWDI'
 SWDI.attrs.update({
     'long_name'       : 'Standardized Wind Deficit Index',
     'units'           : 'dimensionless (z-score)',
-    'description'     : ('Deseasonalised z-score of daily mean wind CF at 100 m. '
-                         'Negative = below seasonal normal (wind drought).'),
-    'reference'       : 'Van der Wiel et al. (2019, Environ. Res. Lett.)',
+    'description'     : 'Deseasonalised z-score of daily mean wind CF at 100 m. ',
     'source_variable' : 'CF_wind — daily mean of hourly wind CF (Vestas V90-2MW power curve)',
     'baseline_period' : f"{int(CF_wind_dly.time.dt.year.min().values)}"
                         f"–{int(CF_wind_dly.time.dt.year.max().values)}",
@@ -267,7 +241,7 @@ print(f"  std   : {float(SWDI.std(skipna=True).values):.3f}   (should be ≈ 1)"
 
 
 #%%
-# ─── SWDI diagnostics ─────────────────────────────────────────────────────────
+# SWDI diagnostics 
 
 swdi_cell = SWDI.isel(latitude=lat_idx, longitude=lon_idx).dropna(dim='time')
 
@@ -299,91 +273,35 @@ plt.show()
 
 
 #%%
-# Seasonal DOY envelope — raw wind CF before and after standardisation.
-# After standardisation the DOY mean of SWDI should be ≈ 0 everywhere,
-# confirming that the seasonal cycle has been successfully removed.
-
-month_starts = [pd.Timestamp(year=2001, month=m, day=1).dayofyear for m in range(1, 13)]
-month_names  = [calendar.month_abbr[m] for m in range(1, 13)]
-
-fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
-fig.suptitle(f'SWDI seasonal cycle — ({central_lat:.2f}°N, {central_lon:.2f}°E)', fontsize=13)
-
-# Top panel: raw wind CF climatology
-doy_vals  = wind_mean_doy['doy'].values
-mean_vals = wind_mean_doy.isel(latitude=lat_idx, longitude=lon_idx).values
-std_vals  = wind_std_doy.isel(latitude=lat_idx, longitude=lon_idx).values
-
-axes[0].plot(doy_vals, mean_vals, color='steelblue', linewidth=2, label='DOY mean CF_wind')
-axes[0].fill_between(doy_vals,
-                     mean_vals - std_vals, mean_vals + std_vals,
-                     color='lightblue', alpha=0.5, label='±1 σ')
-axes[0].set_ylabel('CF_wind (daily mean)')
-axes[0].set_title('Raw wind CF — DOY climatology')
-axes[0].legend(fontsize=10)
-axes[0].grid(True, alpha=0.3)
-
-# Bottom panel: SWDI after standardisation (DOY mean should ≈ 0, std ≈ 1)
-swdi_doy_mean = (
-    SWDI.isel(latitude=lat_idx, longitude=lon_idx)
-    .assign_coords(doy=SWDI.time.dt.dayofyear)
-    .groupby('doy').mean('time')
-)
-swdi_doy_std = (
-    SWDI.isel(latitude=lat_idx, longitude=lon_idx)
-    .assign_coords(doy=SWDI.time.dt.dayofyear)
-    .groupby('doy').std('time')
-)
-
-axes[1].plot(swdi_doy_mean['doy'].values, swdi_doy_mean.values,
-             color='navy', linewidth=2, label='DOY mean SWDI (should ≈ 0)')
-axes[1].fill_between(swdi_doy_mean['doy'].values,
-                     swdi_doy_mean.values - swdi_doy_std.values,
-                     swdi_doy_mean.values + swdi_doy_std.values,
-                     color='lightblue', alpha=0.4, label='±1 σ (should ≈ 1)')
-axes[1].axhline(0, color='black', linewidth=0.8, linestyle='--', alpha=0.5)
-axes[1].set_ylabel('SWDI')
-axes[1].set_title('SWDI after standardisation — seasonality removed')
-axes[1].legend(fontsize=10)
-axes[1].grid(True, alpha=0.3)
-
-axes[1].set_xticks(month_starts)
-axes[1].set_xticklabels(month_names)
-axes[1].set_xlabel('Month')
-plt.tight_layout()
-plt.show()
-
-
-#%%
-# SWDI full time series for the central grid cell.
+# SWDI full time series for the central NL grid cell during 2016-2017 episode
 # Shading around known major European renewable energy drought episodes
 # validates that SWDI captures the events described in the literature.
 
-# Reference dunkelflaute / wind drought periods from Li et al. (2021, Energies)
+# Reference dunkelflaute / wind drought periods from Li et al. (2021)
 # and Mockert et al. (2023): December 2016 and January 2017 are among the most
 # cited severe events in the North Sea region.
 known_events = {
-    'Dec 2016': ('2016-12-01', '2016-12-31'),
-    'Jan 2017': ('2017-01-01', '2017-01-31'),
+    # 'Dec 2016': ('2016-12-01', '2016-12-31'),
+    # 'Jan 2017': ('2017-01-01', '2017-01-31'),
     'Dec 2021': ('2021-12-01', '2021-12-31'),
 }
 
 fig, ax = plt.subplots(figsize=(16, 5))
 
-swdi_cell.plot(ax=ax, color='steelblue', linewidth=0.5, alpha=0.5, label='SWDI (daily)')
-swdi_cell.rolling(time=30, center=True).mean().plot(
-    ax=ax, color='navy', linewidth=2, label='30-day rolling mean')
+swdi_cell.sel(time=slice("2020","2022")).plot(ax=ax, color='steelblue', linewidth=0.8, alpha=0.5, label='SWDI (daily)')
+swdi_cell.sel(time=slice("2020","2022")).rolling(time=14, center=True).mean().plot(
+    ax=ax, color='navy', linewidth=2, label='14-day rolling mean')
 
 ax.axhline(-1.0, color='orange', linestyle='--', linewidth=1.5, label='−1 (moderate deficit)')
-ax.axhline(-1.5, color='red',    linestyle='--', linewidth=1.5, label='−1.5 (severe deficit)')
-ax.axhline( 0,   color='black',  linewidth=0.5,  alpha=0.3)
+# ax.axhline(-1.5, color='red',    linestyle='--', linewidth=1.5, label='−1.5 (severe deficit)')
+ax.axhline( 0,   color='black',  linewidth=0.5,  alpha=0.5)
 
 for label_txt, (t0, t1) in known_events.items():
     ax.axvspan(pd.to_datetime(t0), pd.to_datetime(t1),
                alpha=0.2, color='tomato',
                label='Known wind drought' if label_txt == 'Dec 2016' else '_nolegend_')
-    ax.text(pd.to_datetime(t0), ax.get_ylim()[0] + 0.2, label_txt,
-            fontsize=8, color='firebrick', rotation=90, va='bottom')
+    # ax.text(pd.to_datetime(t0), ax.get_ylim()[0] + 0.2, label_txt,
+    #         fontsize=8, color='firebrick', rotation=90, va='bottom')
 
 ax.set_xlabel('Date', fontsize=12)
 ax.set_ylabel('SWDI', fontsize=12)
@@ -396,7 +314,7 @@ plt.show()
 
 
 #%%
-# ─── Compute SSDI ─────────────────────────────────────────────────────────────
+# Compute SSDI 
 #
 # Standardized Solar Deficit Index:
 #   SSDI < 0    : solar generation below seasonal normal
@@ -545,9 +463,7 @@ plt.show()
 # Scatter of daily (SWDI, SSDI) at the central grid cell.  The lower-left
 # quadrant (both < 0) is the compound dunkelflaute zone.  Clustering in that
 # quadrant beyond what two independent uniform variables would produce is
-# evidence of positive lower-tail dependence — the key result that justifies
-# the compound event framing (Zscheischler & Seneviratne 2017; Van der Wiel
-# et al. 2019).
+# evidence of positive lower-tail dependence
 
 swdi_vals = SWDI.isel(latitude=lat_idx, longitude=lon_idx).values
 ssdi_vals = SSDI.isel(latitude=lat_idx, longitude=lon_idx).values
@@ -600,7 +516,7 @@ plt.show()
 
 
 #%%
-# ─── Save outputs ─────────────────────────────────────────────────────────────
+# Save outputs 
 
 print("\nSaving outputs ...")
 
@@ -628,4 +544,5 @@ CF_solar_daytime_dly.attrs.update({
 CF_solar_daytime_dly.to_zarr(cf_dt_out / 'CF_solar_daytime.zarr', mode='w', consolidated=True)
 print(f"  CF_solar_daytime saved → {cf_dt_out / 'CF_solar_daytime.zarr'}")
 
-print("\n03_calc_SWDI_SSDI.py — complete.")
+
+# %%

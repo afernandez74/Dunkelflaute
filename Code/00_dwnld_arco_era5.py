@@ -55,7 +55,7 @@ dask.config.set({"array.slicing.split_large_chunks": True})
 # Geographic bounding box: [North, West, South, East] (degrees)
 # Base onshore domain (same as ag subproject): [55, -5, 41, 16]
 # + 200 km offshore buffer (~1.8° lat, ~2.9° lon at 48°N mean latitude)
-AREA = [57, -8, 39, 19]
+AREA = [60, -8, 41, 19]
 
 # ARCO-ERA5 variable names (long names as stored in the Zarr store).
 # These map to the short names: u10, v10, u100, v100, ssrd, t2m.

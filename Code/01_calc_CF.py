@@ -45,9 +45,8 @@ Next step
 
 References
 ----------
-  Brown et al. (2021) Renewable Energy Resources, Technology and Data: A
-      review of the literature, doi:10.1016/j.energy.2021.120034
-  Bett & Thornton (2016) doi:10.1002/met.1548
+  Brown et al. (2021) https://doi.org/10.1007/s42452-021-04794-z
+  Bett & Thornton (2016) 10.1016/j.renene.2015.10.006
 
 @author: afer
 """
@@ -78,28 +77,25 @@ WS_RATED  =   13.0   # Rated wind speed [m/s]
 WS_CUTOUT =   25.0   # Cut-out wind speed [m/s]
 
 # ── Solar PV model (Brown et al. 2021 / Bett & Thornton 2016) ──
-ALPHA   =  1.2e-13   # Efficiency temperature coefficient (K⁻¹) — negligible
-BETA    = -4.6e-3    # Efficiency temperature coefficient (K⁻¹) — dominant term
+ALPHA   =  1.2e-13   # Efficiency temperature coefficient (K-1) — negligible
+BETA    = -4.6e-3    # Efficiency temperature coefficient (K-1) — dominant term
 C1      =  0.033     # Irradiance log term
 C2      = -0.0092    # Irradiance log-squared term
 T_NOCT  =   48.0     # Normal operating cell temperature [°C]
 T_0     =   25.0     # Ambient reference temperature for NOCT [°C]
 T_STC   =   25.0     # Cell temperature at standard test conditions [°C]
-G_0     =  800.0     # Reference irradiance for NOCT definition [W/m²]
-G_STC   = 1000.0     # Irradiance at standard test conditions [W/m²]
-G_MIN   =    1.0     # Minimum irradiance threshold for active generation [W/m²]
+G_0     =  800.0     # Reference irradiance for NOCT definition [W/m2]
+G_STC   = 1000.0     # Irradiance at standard test conditions [W/m2]
+G_MIN   =    1.0     # Minimum irradiance threshold for active generation [W/m2]
 
-# ── Zarr output chunking ──
-# Full time axis per (lat, lon) tile → optimal for time-series reads in
-# subsequent scripts (SWDI/SSDI calculation, event detection).
+#  Zarr output chunking
 LAT_CHUNK = 10
 LON_CHUNK = 10
 
 
 #%%
-# ─── Load ERA5 Zarr store ─────────────────────────────────────────────────────
-# Produced by 00b_ETL_nc_to_zarr.py; contains u100, v100, ssrd, t2m (and u10,
-# v10) with short names, longitude wrapped to [−180, 180], and sorted coords.
+# Load ERA5 Zarr store 
+# Produced by 00b_ETL_nc_to_zarr.py; contains u100, v100, ssrd, t2m, u10 and v10
 
 era5_dat = os.environ.get("ERA5_dat")
 if era5_dat is None:
@@ -108,7 +104,7 @@ if era5_dat is None:
         "Add it to ~/.bashrc:  export ERA5_dat=/path/to/era5_data"
     )
 
-zarr_path = Path(era5_dat) / "temps_df" / "processed" / "temps_df_cleaned.zarr"
+zarr_path = Path(era5_dat) / "df_dat" / "processed" / "df_dat_cleaned.zarr"
 print(f"Loading ERA5 Zarr store: {zarr_path}")
 
 ds = xr.open_zarr(zarr_path, consolidated=True, chunks={})
@@ -129,7 +125,7 @@ t2m  = ds['t2m']    # 2 m air temperature [K]
 
 
 #%%
-# ─── Wind capacity factor — Vestas V90-2.0 MW power curve ────────────────────
+#  Wind capacity factor — Vestas V90-2.0 MW power curve 
 #
 # Step 1: wind speed magnitude at 100 m hub height from u and v components.
 # Step 2: piecewise power curve applied with xr.where (evaluated lazily):
@@ -161,7 +157,7 @@ def power_curve_polynomial(ws):
 
     Reference
     ---------
-    Brown et al. (2021), doi:10.1016/j.energy.2021.120034
+    Brown et al. (2021), https://doi.org/10.1007/s42452-021-04794-z
     """
     return (  634.228
             - 1248.5    * ws
@@ -199,21 +195,20 @@ print(f"\nCF_wind computed (lazy) — shape: {CF_wind.shape}")
 
 
 #%%
-# ─── Solar capacity factor — temperature-corrected PV model ──────────────────
+#  Solar capacity factor — temperature-corrected PV model 
 #
-# The model follows Brown et al. (2021) / Bett & Thornton (2016) and consists
-# of two parts:
+# From Brown et al. (2021) / Bett & Thornton (2016) 
 #
 #   1. Module temperature (NOCT approximation):
 #        T_mod = t2m_C + (T_NOCT − T_0) × G / G_0
 #
 #   2. Relative efficiency accounting for temperature derating and irradiance
 #      non-linearity:
-#        η_rel = (1 + α·ΔT) × (1 + c1·ln(G') + c2·(ln G')² + β·ΔT)
+#        eta_rel = (1 + α·ΔT) × (1 + c1·ln(G') + c2·(ln G')² + β·ΔT)
 #      where ΔT = T_mod − T_STC,  G' = G / G_STC.
 #
 #   3. Capacity factor:
-#        CF_solar = η_rel × G / G_STC
+#        CF_solar = eta_rel × G / G_STC
 #
 # Hours with G ≤ G_MIN (1 W/m²) are set to CF_solar = 0 to avoid log(0)
 # and to reflect the physical reality that panels are not generating at night.
@@ -239,12 +234,8 @@ def calc_module_temperature(t2m_c, irr):
 
 def calc_relative_efficiency(t2m_c, irr):
     """
-    Relative PV efficiency accounting for temperature derating and irradiance
-    non-linearity (Brown et al. 2021 / Bett & Thornton 2016).
-
-    Only call this function for grid cells / hours where irr > G_MIN; passing
-    irr ≤ 0 produces log(0) or log(negative) errors.
-
+    Relative PV efficiency accounting for weather
+    
     Parameters
     ----------
     t2m_c : xr.DataArray   Ambient air temperature [°C]
@@ -255,8 +246,8 @@ def calc_relative_efficiency(t2m_c, irr):
     eta_rel : xr.DataArray   Relative efficiency [dimensionless, ≈1 under STC]
     """
     T_mod   = calc_module_temperature(t2m_c, irr)
-    dT      = T_mod - T_STC          # temperature deviation from STC [°C]
-    G_prime = irr / G_STC            # normalised irradiance [dimensionless]
+    dT      = T_mod - T_STC          # temperature deviation 
+    G_prime = irr / G_STC            # normalised irradiance 
     log_G   = np.log(G_prime)         # natural log of normalised irradiance
 
     return (1 + ALPHA * dT) * (1 + C1 * log_G + C2 * log_G**2 + BETA * dT)
@@ -266,7 +257,7 @@ def calc_relative_efficiency(t2m_c, irr):
 irr   = ssrd / 3600.0     # J/m² (accumulated per hour) → W/m² (hourly mean)
 t2m_c = t2m - 273.15      # K → °C
 
-# Apply model; force CF = 0 at night / below detection threshold
+# Apply model; CF = 0 at night / below detection threshold
 CF_solar = xr.where(
     irr > G_MIN,
     calc_relative_efficiency(t2m_c, irr) * irr / G_STC,
@@ -274,28 +265,16 @@ CF_solar = xr.where(
 ).rename('CF_solar')
 
 CF_solar.attrs.update({
-    'long_name'   : 'Solar PV capacity factor — temperature-corrected PV model',
-    'units'       : 'dimensionless',
+    'long_name'   : 'Solar PV capacity factor',
     'valid_range' : [0, 1],
-    'model'       : ('Brown et al. 2021 / Bett & Thornton 2016; '
-                     'G_STC=1000 W/m²; T_NOCT=48°C; G_MIN=1 W/m²'),
-    'reference'   : ('Brown et al. (2021), doi:10.1016/j.energy.2021.120034; '
-                     'Bett & Thornton (2016), doi:10.1002/met.1548'),
-    'ssrd_note'   : 'ssrd converted from J/m²/hour to W/m² by dividing by 3600',
 })
 
 print(f"CF_solar computed (lazy) — shape: {CF_solar.shape}")
 
 
 #%%
-# ─── Diagnostic: spatial maps of time-mean CF ────────────────────────────────
-# Compute the time-averaged CF at every grid cell (triggers Dask computation).
-# Expected spatial patterns:
-#   Wind  — higher CF offshore and at high latitudes; local minima over land
-#   Solar — monotonically increasing southward; near-zero above ~55°N in winter
-# These maps serve as a basic sanity check before running the full pipeline.
-
-print("\nComputing spatial mean CFs (triggers Dask — may take a moment)...")
+# time averaged CF_solar and CF_wind (Sanity check)
+print("\nComputing spatial mean CFs ")
 CF_wind_mean  = CF_wind.mean(dim='time').compute()
 CF_solar_mean = CF_solar.mean(dim='time').compute()
 
@@ -338,7 +317,7 @@ plt.show()
 
 
 #%%
-# ─── Diagnostic: sample grid cell distributions ──────────────────────────────
+# ─── Diagnostic: sample grid cell distributions 
 # Box-and-whisker plot and empirical distribution at the central grid cell.
 # Wind: bimodal distribution (mode at zero = calm conditions + generating mode)
 # Solar: tri-modal (night zeros dominant; low winter peak; high summer peak)
@@ -437,10 +416,7 @@ plt.show()
 
 
 #%%
-# ─── Save hourly CFs to Zarr ─────────────────────────────────────────────────
-# Output Zarr stores: one per CF variable, consumed by 02_calc_CF_daily.py.
-# Rechunk to full time axis per (lat, lon) tile before writing — this chunking
-# layout is optimal for the time-series reads performed by downstream scripts.
+#  Save hourly CFs to Zarr 
 
 results_base   = Path('./../Results')
 out_wind_zarr  = results_base / 'CF_wind'  / 'CF_wind_hrly.zarr'
@@ -464,4 +440,5 @@ print(f"  Done.")
 print("\nHourly CFs saved successfully.")
 print(f"  CF_wind  : {out_wind_zarr}")
 print(f"  CF_solar : {out_solar_zarr}")
-print("\nNext step: run 02_calc_CF_daily.py")
+
+# %%

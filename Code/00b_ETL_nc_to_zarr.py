@@ -36,7 +36,7 @@ Environment
                and writes to $ERA5_dat/df_dat/processed/
 
 """
-
+#%%
 import os
 import logging
 from pathlib import Path
@@ -82,7 +82,7 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-
+#%%
 # ─────────────────────────────────────────────────────────────────────────────
 # ETL FUNCTION
 # ─────────────────────────────────────────────────────────────────────────────
@@ -118,9 +118,10 @@ def convert_nc_to_zarr(folder_name: str, base_dir: Path) -> None:
     log.info("Opening files with xr.open_mfdataset (parallel=True, lazy) …")
     ds = xr.open_mfdataset(
         files,
-        combine="by_coords",
+        combine="nested",
+        concat_dim="time",
         parallel=False,
-        chunks={},          
+        chunks={},
     )
     log.info(
         "Dataset loaded — variables: %s | time: %d steps | lat: %d | lon: %d",
