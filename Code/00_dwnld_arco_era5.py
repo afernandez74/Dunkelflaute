@@ -53,9 +53,8 @@ dask.config.set({"array.slicing.split_large_chunks": True})
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Geographic bounding box: [North, West, South, East] (degrees)
-# Base onshore domain (same as ag subproject): [55, -5, 41, 16]
 # + 200 km offshore buffer (~1.8° lat, ~2.9° lon at 48°N mean latitude)
-AREA = [60, -8, 41, 19]
+AREA = [62, -14, 42, 18]
 
 # ARCO-ERA5 variable names (long names as stored in the Zarr store).
 # These map to the short names: u10, v10, u100, v100, ssrd, t2m.
@@ -63,17 +62,26 @@ AREA = [60, -8, 41, 19]
 #       the ETL/CF pipeline can optionally compute a hub-height wind speed
 #       by log-law extrapolation if needed; remove them to reduce file size.
 VARIABLES = [
-    "10m_u_component_of_wind",        # u10  — near-surface wind (onshore reference)
-    "10m_v_component_of_wind",        # v10
+    # "10m_u_component_of_wind",        # u10  — near-surface wind (onshore reference)
+    # "10m_v_component_of_wind",        # v10
     "100m_u_component_of_wind",       # u100 — hub-height wind (primary for CF)
     "100m_v_component_of_wind",       # v100
     "surface_solar_radiation_downwards",  # ssrd — accumulated J/m² per hour
     "2m_temperature",                 # t2m  — PV temperature correction
+    "geopotential"  # on pressure levels — subset to 500 hPa below (Z500)
 ]
 
 # Temporal domain
 YEAR_START = 1980
 YEAR_END   = 2024          # inclusive; script caps at last available date
+
+
+# Pressure level (hPa) for level-based variables 
+PRESSURE_LEVEL = 500
+
+# Z = geopotential / g.  True → store as height `z` in metres; False → raw geopotential.
+CONVERT_TO_GEOPOTENTIAL_HEIGHT = True
+G0 = 9.80 
 
 # Output directory — NetCDF files written here, one per year
 # Uses the same ERA5_dat env var as the 'ag' subproject, but a separate
@@ -138,25 +146,41 @@ def select_variables(ds: xr.Dataset, variables: list[str]) -> xr.Dataset:
         )
     return ds[variables]
 
+def select_pressure_level(ds: xr.Dataset, level_hpa: int) -> xr.Dataset:
+    """
+    Subset level-based variables (e.g. geopotential) to a single pressure level.
+    Surface variables (no 'level' dim) pass through unchanged; the scalar `level`
+    coordinate is retained for provenance.
+    """
+    if "level" not in ds.dims and "level" not in ds.coords:
+        return ds
+    ds = ds.sel(level=level_hpa)
+    log.info("Selected pressure level: %d hPa", level_hpa)
+    return ds
+
 
 def select_area(ds: xr.Dataset, area: list[float]) -> xr.Dataset:
-    """
-    Spatial subset using ERA5 native 0–360 longitude coordinates.
-    Handles domains that cross the Greenwich meridian safely.
-    """
     north, west, south, east = area
+    lat_slice = slice(north, south)  
 
+    # Convert to 0–360
     west_360 = west % 360
     east_360 = east % 360
-    lat_slice = slice(north, south)   # ERA5 latitude is stored N→S
 
     if west_360 <= east_360:
-        ds = ds.sel(latitude=lat_slice, longitude=slice(west_360, east_360))
+        # Domain does not cross Greenwich
+        ds = ds.sel(
+            latitude=lat_slice,
+            longitude=slice(west_360, east_360)
+        )
     else:
-        # Domain crosses Greenwich (e.g. west < 0 wraps to > 180)
-        ds_west = ds.sel(latitude=lat_slice, longitude=slice(west_360, 360))
-        ds_east = ds.sel(latitude=lat_slice, longitude=slice(0, east_360))
-        ds = xr.concat([ds_west, ds_east], dim="longitude")
+        # Domain crosses Greenwich — concatenate west and east chunks,
+        # then reassign longitudes to a continuous -180→180 range
+        ds_e = ds.sel(latitude=lat_slice, longitude=slice(0, east_360))
+        ds_w = ds.sel(latitude=lat_slice, longitude=slice(west_360, 360))
+        # Shift west chunk longitudes to negative so concat is monotonic
+        ds_w = ds_w.assign_coords(longitude=ds_w.longitude.values - 360)
+        ds = xr.concat([ds_w, ds_e], dim="longitude")
 
     log.info(
         "Spatial subset: lat [%.2f → %.2f], lon [%.2f → %.2f]  (%d × %d grid cells)",
@@ -169,6 +193,20 @@ def select_area(ds: xr.Dataset, area: list[float]) -> xr.Dataset:
     )
     return ds
 
+
+
+def to_geopotential_height(ds: xr.Dataset) -> xr.Dataset:
+    """Convert `geopotential` (m² s⁻²) → geopotential height `z` (m)."""
+    if "geopotential" not in ds.data_vars:
+        return ds
+    ds = ds.rename({"geopotential": "z"})
+    ds["z"] = ds["z"] / G0
+    ds["z"].attrs.update(
+        units="m",
+        long_name="Geopotential height",
+        standard_name="geopotential_height",
+    )
+    return ds
 
 def build_encoding(ds: xr.Dataset) -> dict:
     """Build per-variable NetCDF encoding dictionary."""
@@ -250,6 +288,11 @@ def main() -> None:
     # ── Variable selection ───────────────────────────────────────────────────
     ds = select_variables(ds_full, VARIABLES)
 
+    # pressure-level subset (geopotential height single level z500)
+    ds = select_pressure_level(ds, PRESSURE_LEVEL)
+    if CONVERT_TO_GEOPOTENTIAL_HEIGHT:
+        ds = to_geopotential_height(ds)
+    
     # ── Spatial subsetting ───────────────────────────────────────────────────
     ds = select_area(ds, AREA)
 

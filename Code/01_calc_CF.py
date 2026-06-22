@@ -317,21 +317,24 @@ plt.show()
 
 
 #%%
-# ─── Diagnostic: sample grid cell distributions 
+# sample grid cell distributions 
 # Box-and-whisker plot and empirical distribution at the central grid cell.
 # Wind: bimodal distribution (mode at zero = calm conditions + generating mode)
 # Solar: tri-modal (night zeros dominant; low winter peak; high summer peak)
 
-lat_idx = ds.sizes['latitude']  // 2
-lon_idx = ds.sizes['longitude'] // 2
-central_lat = float(ds.latitude.values[lat_idx])
-central_lon = float(ds.longitude.values[lon_idx])
+# lat_idx = ds.sizes['latitude']  // 2
+# lon_idx = ds.sizes['longitude'] // 2
+# central_lat = float(ds.latitude.values[lat_idx])
+# central_lon = float(ds.longitude.values[lon_idx])
+central_lat = 52
+central_lon = 5
 
 print(f"\nSample grid cell: ({central_lat:.2f}°N, {central_lon:.2f}°E)")
 
-CF_wind_cell  = CF_wind.isel(latitude=lat_idx, longitude=lon_idx).compute()
-CF_solar_cell = CF_solar.isel(latitude=lat_idx, longitude=lon_idx).compute()
-
+# CF_wind_cell  = CF_wind.isel(latitude=lat_idx, longitude=lon_idx).compute()
+# CF_solar_cell = CF_solar.isel(latitude=lat_idx, longitude=lon_idx).compute()
+CF_wind_cell  = CF_wind.sel(latitude=central_lat, longitude=central_lon, method = 'nearest').compute()
+CF_solar_cell  = CF_solar.sel(latitude=central_lat, longitude=central_lon, method = 'nearest').compute()
 fig, axes = plt.subplots(2, 2, figsize=(12, 8))
 fig.suptitle(
     f'Hourly CF distributions — sample grid cell ({central_lat:.2f}°N, {central_lon:.2f}°E)',
@@ -368,7 +371,7 @@ plt.show()
 
 
 #%%
-# ─── Diagnostic: mean seasonal cycle at central grid cell ────────────────────
+# Diagnostic: mean seasonal cycle at Utrecht cell
 # DOY mean ± 1 std envelope over the full record.
 # Wind: modest winter peak due to stronger extratropical cyclone activity.
 # Solar: strong summer peak; near-zero mean in winter months above ~50°N.
@@ -410,11 +413,188 @@ for ax, mean, std, name, color in zip(
     ax.set_title(name)
     ax.legend(fontsize=9)
     ax.grid(True, alpha=0.3, linestyle='--')
+    ax.set_xlim(0,364)
 
 plt.tight_layout(rect=[0, 0, 1, 0.95])
 plt.show()
 
+#%%
+# 2018 test
+# 2018 winter/spring anomaly — Jan–Apr vs climatology
+# Plot hourly CF for Jan–Apr 2018 against the DOY mean ± 1 std envelope
+# computed above. The shared DOY x-axis allows direct visual comparison.
 
+# ── Slice to Jan–Apr 2018 ────────────────────────────────────────────────────
+time_mask_2018 = (
+    (CF_wind_cell.time.dt.year  == 2018) &
+    (CF_wind_cell.time.dt.month <= 5)
+)
+wind_2018  = CF_wind_cell.sel(time=time_mask_2018).compute()
+solar_2018 = CF_solar_cell.sel(time=time_mask_2018).compute()
+
+# Fractional DOY for hourly data (hour 0 of DOY n → n.0, hour 23 → n.958…)
+doy_2018 = (wind_2018.time.dt.dayofyear.values
+            + wind_2018.time.dt.hour.values / 24.0)
+
+# DOY range for Jan–Apr (non-leap: 1–120; 2018 is non-leap)
+doy_janApr = np.arange(1, 151)   # DOY 1–120
+
+# ── Climatology slice (DOY 1–120, 0-indexed arrays) ─────────────────────────
+clim_wind_mean  = wind_doy_mean[:150]
+clim_wind_std   = wind_doy_std[:150]
+clim_solar_mean = solar_doy_mean[:150]
+clim_solar_std  = solar_doy_std[:150]
+
+# ── Month boundary ticks for Jan–Apr ─────────────────────────────────────────
+month_ticks_janApr  = [pd.Timestamp(2018, m, 1).dayofyear for m in range(1, 6)]
+month_labels_janApr = ['Jan', 'Feb', 'Mar', 'Apr', 'May']
+
+# ── Plot ─────────────────────────────────────────────────────────────────────
+fig, axes = plt.subplots(2, 1, figsize=(14, 8), sharex=True)
+fig.suptitle(
+    f'Jan–Apr 2018 vs climatology — ({central_lat:.2f}°N, {central_lon:.2f}°E)',
+    fontsize=13, fontweight='bold'
+)
+
+for ax, (mean_clim, std_clim, da_2018, name, color_clim, color_2018) in zip(
+    axes,
+    [
+        (clim_wind_mean,  clim_wind_std,  wind_2018,  'CF_wind  (V90 @ 100 m)', 'steelblue', 'navy'),
+        (clim_solar_mean, clim_solar_std, solar_2018, 'CF_solar (PV model)',     'goldenrod', 'darkorange'),
+    ]
+):
+    # Climatological envelope
+    ax.fill_between(
+        doy_janApr,
+        mean_clim - std_clim,
+        mean_clim + std_clim,
+        color=color_clim, alpha=0.25, label='Climatology ± 1 std'
+    )
+    ax.plot(
+        doy_janApr, mean_clim,
+        color=color_clim, linewidth=2.0, label='Climatology mean'
+    )
+
+    # 2018 hourly values
+    ax.plot(
+        doy_2018, da_2018.values,
+        color=color_2018, linewidth=0.6, alpha=0.75, label='2018 (hourly)'
+    )
+
+    # Month boundary lines
+    for tick in month_ticks_janApr:
+        ax.axvline(tick, color='gray', linewidth=0.8, linestyle='--', alpha=0.6)
+
+    ax.set_xlim(120, 150)
+    ax.set_ylim(bottom=0)
+    ax.set_xticks(month_ticks_janApr)
+    ax.set_xticklabels(month_labels_janApr, fontsize=10)
+    ax.set_ylabel('CF [ ]')
+    ax.set_title(name, fontsize=11)
+    ax.legend(fontsize=9, loc='upper right')
+    ax.grid(True, alpha=0.25, linestyle='--')
+
+plt.tight_layout(rect=[0, 0, 1, 0.96])
+plt.show()
+#%%
+# Combined CF & t2m: 2018 Jan–Jun — shared z-score axis with co-occurrence shading
+
+ROLLING_DAYS = 5   # smoothing window; set to 1 to disable
+
+# ── t2m at sample cell ───────────────────────────────────────────────────────
+t2m_cell = t2m.sel(latitude=central_lat, longitude=central_lon, method='nearest').compute()
+
+# ── Combined CF ───────────────────────────────────────────────────────────────
+CF_comb_cell = 0.75 * CF_wind_cell + 0.25 * CF_solar_cell
+
+# ── Daily means over full record ──────────────────────────────────────────────
+CF_comb_daily_full = CF_comb_cell.resample(time='1D').mean()
+t2m_daily_full     = t2m_cell.resample(time='1D').mean()
+
+# ── DOY mean and std (full record) ───────────────────────────────────────────
+def doy_clim(da):
+    """Return DOY mean and std arrays (length 365) from a daily DataArray."""
+    grp  = da.assign_coords(doy=da.time.dt.dayofyear).groupby('doy')
+    mean = grp.mean().values[:365]
+    std  = grp.std().values[:365]
+    return mean, std
+
+clim_cf_mean,  clim_cf_std  = doy_clim(CF_comb_daily_full)
+clim_t2m_mean, clim_t2m_std = doy_clim(t2m_daily_full)
+
+# ── Slice to Jan–Jun 2018 ────────────────────────────────────────────────────
+time_mask_H1 = (
+    (CF_comb_daily_full.time.dt.year  == 2018) &
+    (CF_comb_daily_full.time.dt.month <= 6)
+)
+cf_2018  = CF_comb_daily_full.sel(time=time_mask_H1)
+t2m_2018 = t2m_daily_full.sel(time=time_mask_H1)
+
+doy_2018 = cf_2018.time.dt.dayofyear.values   # integer DOY
+
+# ── Z-scores ─────────────────────────────────────────────────────────────────
+# Index into DOY climatology arrays (DOY is 1-based → subtract 1)
+doy_idx = doy_2018 - 1
+
+z_cf  = (cf_2018.values  - clim_cf_mean[doy_idx])  / clim_cf_std[doy_idx]
+z_t2m = (t2m_2018.values - clim_t2m_mean[doy_idx]) / clim_t2m_std[doy_idx]
+
+# ── Optional rolling smoothing ────────────────────────────────────────────────
+def rolling_mean(arr, w):
+    return pd.Series(arr).rolling(w, center=True, min_periods=1).mean().values
+
+z_cf_s  = rolling_mean(z_cf,  ROLLING_DAYS)
+z_t2m_s = rolling_mean(z_t2m, ROLLING_DAYS)
+
+# ── Co-occurrence mask: both below climatological mean ────────────────────────
+both_negative = (z_cf_s < 0) & (z_t2m_s < 0)
+
+# ── Plot ──────────────────────────────────────────────────────────────────────
+COLOR_CF   = '#1f77b4'   # blue
+COLOR_T2M  = '#d62728'   # red
+COLOR_COOC = '#b0b0b0'   # grey shading
+
+month_ticks_H1  = [pd.Timestamp(2018, m, 1).dayofyear for m in range(1, 7)]
+month_labels_H1 = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun']
+
+fig, ax = plt.subplots(figsize=(14, 5))
+
+# Co-occurrence shading (behind everything)
+ax.fill_between(doy_2018, -4, 4,
+                where=both_negative,
+                color=COLOR_COOC, alpha=0.35, linewidth=0,
+                label='Both below climatology')
+
+# Zero reference
+ax.axhline(0, color='black', linewidth=0.8, linestyle='-', alpha=0.5)
+
+# Z-score lines
+ax.plot(doy_2018, z_cf_s,
+        color=COLOR_CF,  linewidth=1.8, label=f'CF_comb z-score ({ROLLING_DAYS}-day smooth)')
+ax.plot(doy_2018, z_t2m_s,
+        color=COLOR_T2M, linewidth=1.8, label=f't2m z-score ({ROLLING_DAYS}-day smooth)')
+
+# Month boundaries
+for tick in month_ticks_H1:
+    ax.axvline(tick, color='gray', linewidth=0.8, linestyle='--', alpha=0.5)
+
+ax.set_xticks(month_ticks_H1)
+ax.set_xticklabels(month_labels_H1, fontsize=10)
+ax.set_xlim(1, 181)
+ax.set_ylim(-4, 4)
+ax.set_ylabel('Standardised anomaly (z-score)  [ ]')
+ax.legend(fontsize=9, loc='upper right')
+ax.grid(True, alpha=0.2, linestyle='--')
+ax.set_title(
+    f'Jan–Jun 2018 — combined CF & t2m standardised anomalies\n'
+    f'({central_lat:.2f}°N, {central_lon:.2f}°E)  |  '
+    f'DOY climatology: {int(CF_comb_daily_full.time.dt.year.min())}–'
+    f'{int(CF_comb_daily_full.time.dt.year.max())}',
+    fontsize=12, fontweight='bold'
+)
+
+plt.tight_layout()
+plt.show()
 #%%
 #  Save hourly CFs to Zarr 
 

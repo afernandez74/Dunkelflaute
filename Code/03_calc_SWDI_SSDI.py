@@ -242,8 +242,7 @@ print(f"  std   : {float(SWDI.std(skipna=True).values):.3f}   (should be ≈ 1)"
 
 #%%
 # SWDI diagnostics 
-
-swdi_cell = SWDI.isel(latitude=lat_idx, longitude=lon_idx).dropna(dim='time')
+swdi_cell = SWDI.sel(latitude=central_lat, longitude=central_lon).dropna(dim='time')
 
 # Box & Whisker + empirical distribution
 fig, axs = plt.subplots(1, 2, figsize=(11, 5))
@@ -281,27 +280,27 @@ plt.show()
 # and Mockert et al. (2023): December 2016 and January 2017 are among the most
 # cited severe events in the North Sea region.
 known_events = {
-    # 'Dec 2016': ('2016-12-01', '2016-12-31'),
-    # 'Jan 2017': ('2017-01-01', '2017-01-31'),
-    'Dec 2021': ('2021-12-01', '2021-12-31'),
+    'Dec 2016': ('2016-12-01', '2016-12-31'),
+    'Jan 2017': ('2017-01-01', '2017-01-31'),
+    # 'Dec 2021': ('2021-12-01', '2021-12-31'),
 }
 
 fig, ax = plt.subplots(figsize=(16, 5))
 
-swdi_cell.sel(time=slice("2020","2022")).plot(ax=ax, color='steelblue', linewidth=0.8, alpha=0.5, label='SWDI (daily)')
-swdi_cell.sel(time=slice("2020","2022")).rolling(time=14, center=True).mean().plot(
+swdi_cell.sel(time=slice("2016","2018")).plot(ax=ax, color='steelblue', linewidth=0.8, alpha=0.5, label='SWDI (daily)')
+swdi_cell.sel(time=slice("2016","2018")).rolling(time=14, center=True).mean().plot(
     ax=ax, color='navy', linewidth=2, label='14-day rolling mean')
 
 ax.axhline(-1.0, color='orange', linestyle='--', linewidth=1.5, label='−1 (moderate deficit)')
-# ax.axhline(-1.5, color='red',    linestyle='--', linewidth=1.5, label='−1.5 (severe deficit)')
+ax.axhline(-1.5, color='red',    linestyle='--', linewidth=1.5, label='−1.5 (severe deficit)')
 ax.axhline( 0,   color='black',  linewidth=0.5,  alpha=0.5)
 
 for label_txt, (t0, t1) in known_events.items():
     ax.axvspan(pd.to_datetime(t0), pd.to_datetime(t1),
                alpha=0.2, color='tomato',
                label='Known wind drought' if label_txt == 'Dec 2016' else '_nolegend_')
-    # ax.text(pd.to_datetime(t0), ax.get_ylim()[0] + 0.2, label_txt,
-    #         fontsize=8, color='firebrick', rotation=90, va='bottom')
+    ax.text(pd.to_datetime(t0), ax.get_ylim()[0] + 0.2, label_txt,
+            fontsize=8, color='firebrick', rotation=90, va='bottom')
 
 ax.set_xlabel('Date', fontsize=12)
 ax.set_ylabel('SWDI', fontsize=12)
@@ -356,7 +355,7 @@ print(f"  NaN fraction : {nan_frac:.1f}%  (expected ~10–25% for NL winter days
 #%%
 # ─── SSDI diagnostics ─────────────────────────────────────────────────────────
 
-ssdi_cell = SSDI.isel(latitude=lat_idx, longitude=lon_idx).dropna(dim='time')
+ssdi_cell = SSDI.sel(latitude=central_lat, longitude=central_lon).dropna(dim='time')
 
 fig, axs = plt.subplots(1, 2, figsize=(11, 5))
 fig.suptitle(f'SSDI — central grid cell ({central_lat:.2f}°N, {central_lon:.2f}°E)',
@@ -388,12 +387,14 @@ plt.show()
 # Seasonal DOY envelope for solar CF — this plot is particularly important
 # because it shows WHY winter SSDI is NaN: the solar CF DOY std collapses
 # to near zero in November–January at Netherlands latitudes (~52°N).
-
+month_starts = [sum(calendar.monthrange(2001, m)[1] for m in range(1, i+1)) - 
+                calendar.monthrange(2001, i)[1] + 1 for i in range(1, 13)]
+month_names  = [calendar.month_abbr[m] for m in range(1, 13)]
 fig, axes = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
 fig.suptitle(f'SSDI seasonal cycle — ({central_lat:.2f}°N, {central_lon:.2f}°E)', fontsize=13)
 
-solar_doy_mean = solar_mean_doy.isel(latitude=lat_idx, longitude=lon_idx).values
-solar_doy_std  = solar_std_doy.isel(latitude=lat_idx, longitude=lon_idx).values
+solar_doy_mean = solar_mean_doy.sel(latitude=central_lat, longitude=central_lon).values
+solar_doy_std  = solar_std_doy.sel(latitude=central_lat, longitude=central_lon).values
 doy_ax         = solar_mean_doy['doy'].values
 
 # Raw solar CF DOY mean ± 1σ
@@ -415,7 +416,7 @@ axes[1].grid(True, alpha=0.3)
 
 # SSDI DOY mean after standardisation (non-NaN DOYs only)
 ssdi_doy_mean = (
-    SSDI.isel(latitude=lat_idx, longitude=lon_idx)
+    SSDI.sel(latitude=central_lat, longitude=central_lon)
     .dropna(dim='time')
     .assign_coords(doy=lambda x: x.time.dt.dayofyear)
     .groupby('doy').mean('time')
@@ -459,61 +460,94 @@ plt.show()
 
 
 #%%
-# ─── Joint SWDI–SSDI distribution ─────────────────────────────────────────────
-# Scatter of daily (SWDI, SSDI) at the central grid cell.  The lower-left
-# quadrant (both < 0) is the compound dunkelflaute zone.  Clustering in that
-# quadrant beyond what two independent uniform variables would produce is
-# evidence of positive lower-tail dependence
+# ─── Joint SWDI–SSDI distribution (percentile-based thresholds) ───────────────
+# Thresholds are derived from each index's own marginal distribution so that
+# "moderate" = below 10th percentile and "severe" = below 5th percentile.
+# This is more robust than fixed z-score cuts because the empirical
+# percentiles are by construction dataset-independent.
 
-swdi_vals = SWDI.isel(latitude=lat_idx, longitude=lon_idx).values
-ssdi_vals = SSDI.isel(latitude=lat_idx, longitude=lon_idx).values
+# ─── Joint SWDI–SSDI distribution (percentile-based thresholds) ───────────────
 
-# Align: only use days where both are valid
-valid_mask = np.isfinite(swdi_vals) & np.isfinite(ssdi_vals)
+swdi_vals = SWDI.sel(latitude=central_lat, longitude=central_lon).values
+ssdi_vals = SSDI.sel(latitude=central_lat, longitude=central_lon).values
+time_vals = SSDI.time.values  # shared time axis
+
+# ── Winter mask (NDJ: November, December, January) ────────────────────────────
+months = pd.DatetimeIndex(time_vals).month
+winter_mask = np.isin(months, [12, 1, 2])
+
+valid_mask = np.isfinite(swdi_vals) & np.isfinite(ssdi_vals) & winter_mask
 sw = swdi_vals[valid_mask]
 ss = ssdi_vals[valid_mask]
 
-# Count days in compound quadrant (both < −1) vs independence expectation
-p_wind  = np.mean(sw < -1.0)
-p_solar = np.mean(ss < -1.0)
-p_joint = np.mean((sw < -1.0) & (ss < -1.0))
+
+# ── Percentile thresholds (marginal, computed independently) ──────────────────
+MODERATE_PCT = 5   # % — initial / moderate deficit flag
+SEVERE_PCT   =  1   # % — severity filter
+
+sw_mod = np.nanpercentile(sw, MODERATE_PCT)
+sw_sev = np.nanpercentile(sw, SEVERE_PCT)
+ss_mod = np.nanpercentile(ss, MODERATE_PCT)
+ss_sev = np.nanpercentile(ss, SEVERE_PCT)
+
+print(f"\nPercentile thresholds at ({central_lat:.2f}°N, {central_lon:.2f}°E):")
+print(f"  SWDI  {MODERATE_PCT}th pct (moderate) = {sw_mod:.3f}")
+print(f"  SWDI  {SEVERE_PCT}th  pct (severe)   = {sw_sev:.3f}")
+print(f"  SSDI  {MODERATE_PCT}th pct (moderate) = {ss_mod:.3f}")
+print(f"  SSDI  {SEVERE_PCT}th  pct (severe)   = {ss_sev:.3f}")
+
+# ── PMF stats at moderate threshold ───────────────────────────────────────────
+p_wind  = np.mean(sw < sw_mod)
+p_solar = np.mean(ss < ss_mod)
+p_joint = np.mean((sw < sw_mod) & (ss < ss_mod))
 pmf     = p_joint / (p_wind * p_solar) if (p_wind * p_solar) > 0 else np.nan
-print(f"\nJoint distribution stats at ({central_lat:.2f}N, {central_lon:.2f}E):")
-print(f"  P(SWDI < −1)                  = {p_wind:.4f}")
-print(f"  P(SSDI < −1)                  = {p_solar:.4f}")
-print(f"  P(SWDI < −1 AND SSDI < −1)    = {p_joint:.4f}")
-print(f"  P_independence                = {p_wind*p_solar:.4f}")
-print(f"  PMF (actual / independent)    = {pmf:.2f}  "
+
+print(f"\nJoint distribution stats (moderate threshold = {MODERATE_PCT}th pct):")
+print(f"  P(SWDI < {sw_mod:.3f})                     = {p_wind:.4f}")
+print(f"  P(SSDI < {ss_mod:.3f})                     = {p_solar:.4f}")
+print(f"  P(SWDI < {sw_mod:.3f} AND SSDI < {ss_mod:.3f}) = {p_joint:.4f}")
+print(f"  P_independence                            = {p_wind * p_solar:.4f}")
+print(f"  PMF (actual / independent)                = {pmf:.2f}  "
       f"(>1 = compound amplification; Van der Wiel et al. 2019)")
 
+# ── Plot ───────────────────────────────────────────────────────────────────────
 fig, ax = plt.subplots(figsize=(7, 7))
 
-# Colour points by combined severity so extreme events stand out
-combined_deficit = np.clip(-0.5 * sw + -0.5 * ss, 0, None)  # higher = worse
+combined_deficit = np.clip(-0.5 * sw - 0.5 * ss, 0, None)
 sc = ax.scatter(sw, ss, c=combined_deficit, cmap='YlOrRd', s=3, alpha=0.35)
 plt.colorbar(sc, ax=ax, label='Combined deficit (higher = more severe)')
 
-for thresh, col, lbl in [(-1.0, 'orange', '−1 (moderate)'), (-1.5, 'red', '−1.5 (severe)')]:
-    ax.axvline(thresh, color=col, linestyle='--', linewidth=1.2, alpha=0.8, label=f'Threshold {lbl}')
-    ax.axhline(thresh, color=col, linestyle='--', linewidth=1.2, alpha=0.8)
+# Moderate and severe threshold lines — separate per index
+for sw_thresh, ss_thresh, col, lbl in [
+    (sw_mod, ss_mod, 'orange', f'Moderate ({MODERATE_PCT}th pct)'),
+    (sw_sev, ss_sev, 'red',    f'Severe ({SEVERE_PCT}th pct)'),
+]:
+    ax.axvline(sw_thresh, color=col, linestyle='--', linewidth=1.2, alpha=0.8,
+               label=f'SWDI {lbl}: {sw_thresh:.2f}')
+    ax.axhline(ss_thresh, color=col, linestyle='--', linewidth=1.2, alpha=0.8,
+               label=f'SSDI {lbl}: {ss_thresh:.2f}')
 
-# Shade the main compound zone
-ax.fill_betweenx([-6, -1], -6, -1, color='red', alpha=0.07,
-                 label=f'Compound zone (both < −1)\nP_joint={p_joint:.4f}, PMF={pmf:.2f}')
+# Shade moderate compound zone — boolean mask handles asymmetric thresholds
+compound_mod = (sw < sw_mod) & (ss < ss_mod)
+ax.scatter(sw[compound_mod], ss[compound_mod],
+           color='red', s=4, alpha=0.12, zorder=0,
+           label=f'Compound zone ({MODERATE_PCT}th pct)\nP_joint={p_joint:.4f}, PMF={pmf:.2f}')
+
 ax.axvline(0, color='black', linewidth=0.5, alpha=0.3)
 ax.axhline(0, color='black', linewidth=0.5, alpha=0.3)
 
 ax.set_xlabel('SWDI  (wind deficit ← left)', fontsize=12)
 ax.set_ylabel('SSDI  (solar deficit ← down)', fontsize=12)
-ax.set_title(f'Joint SWDI–SSDI distribution\n({central_lat:.2f}°N, {central_lon:.2f}°E)\n'
-             f'n = {valid_mask.sum():,} days', fontsize=12)
+ax.set_title(
+    f'Joint SWDI–SSDI distribution\n({central_lat:.2f}°N, {central_lon:.2f}°E)\n'
+    f'n = {valid_mask.sum():,} days  |  thresholds: {MODERATE_PCT}th / {SEVERE_PCT}th pct',
+    fontsize=12)
 ax.set_xlim(-5, 4)
 ax.set_ylim(-5, 4)
 ax.legend(fontsize=9, loc='upper right')
 ax.grid(True, alpha=0.2)
 plt.tight_layout()
 plt.show()
-
 
 #%%
 # Save outputs 

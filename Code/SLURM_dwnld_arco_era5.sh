@@ -7,9 +7,9 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=64G                     # 6 variables × broader domain → ~2× memory vs ag
-#SBATCH --time=03:00:00               # hourly, 6 vars, wider domain — allow extra time
-#SBATCH --export=ALL                  # inherits ERA5_dat, MAMBA_EXE, MAMBA_ROOT_PREFIX
+#SBATCH --mem=64G                   
+#SBATCH --time=03:00:00
+#SBATCH --export=ALL   
 
 # ─────────────────────────────────────────────────────────────────────────────
 # NOTES
@@ -19,9 +19,7 @@
 # in this directory).
 #
 # Each array task downloads one calendar year of:
-#   u10, v10, u100, v100, ssrd, t2m
-# for the extended European domain [N57, W8, S39, E19] and saves a compressed
-# NetCDF file to $ERA5_dat/df_dat/era5_<YEAR>.nc
+#   u100, v100, ssrd, t2m, z500
 #
 # Memory note: 6 variables × ~96 lon pts × ~73 lat pts × 8760 h ≈ 2.4 GB raw
 # float32 per year; 64 GB allows comfortable dask overhead and multi-threading.

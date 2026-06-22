@@ -1,9 +1,22 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-Representative 2018 normalised anomalies for NL.
-For visual representation of case studies in a single critical year.
+plot_2018_anomalies.py
+======================
+Diagnostic plots for 2018 dunkelflaute and agricultural drought signals
+over the Netherlands.
+
+Figures
+-------
+  1. Full year 2018 — CF_comb z-score, t2m z-score, SMDI, SVDI (no shading)
+  2. Jan–Jun 2018  — CF_comb & t2m z-scores with cold/low-CF co-occurrence shading
+  3. Apr–Sep 2018  — SMDI & SVDI with compound agricultural stress shading
+
+All series smoothed with a centred ROLLING_DAYS rolling mean before plotting.
 """
-#%%
-# Imports
+
+# %%
+# ── Imports ───────────────────────────────────────────────────────────────────
 import os
 from pathlib import Path
 
@@ -11,236 +24,250 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 import geopandas as gpd
-import rioxarray  # noqa: F401 – registers the .rio accessor
+import rioxarray  # noqa: F401
 
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
-import matplotlib.lines as mlines
 import matplotlib.dates as mdates
-from scipy.ndimage import uniform_filter1d
+import matplotlib as mpl
+mpl.rcParams['axes.labelsize']  = 14   # x and y axis labels
+mpl.rcParams['xtick.labelsize'] = 14    # x tick marks
+mpl.rcParams['ytick.labelsize'] = 14    # y tick marks
+mpl.rcParams['axes.titlesize']  = 16   # subplot titles
 
-#%%
-# paths
+
+# %%
+# ── Paths ─────────────────────────────────────────────────────────────────────
 ERA5_path = Path(os.environ["ERA5_dat"])
-CF_path = Path("./../Results/CF_daily")
-CDHW_path = Path("~/CDHW_ag/Results")
+DF_path   = Path("./../Results/")
+CDHW_path = Path("~/CDHW_ag/Results").expanduser()
 
-ssdi_path = CF_path / "CF_solar_24h_daily.zarr"
-swdi_path = CF_path / "CF_wind_daily.zarr"
+cf_wind_path  = DF_path   / "CF_wind"  / "CF_wind_hrly.zarr"
+cf_solar_path = DF_path   / "CF_solar" / "CF_solar_hrly.zarr"
+era5_path     = ERA5_path / "df_dat"   / "processed" / "df_dat_cleaned.zarr"
+smdi_path     = CDHW_path / "SMDI"    / "smdi.zarr"
+svdi_path     = CDHW_path / "SVDI"    / "svdi.zarr"
 
-smdi_path = CDHW_path / "SMDI" / "smdi.zarr"
-svdi_path = CDHW_path / "SVDI" / "svdi.zarr"
-
-# Natural Earth shapefile
 countries_path = Path("../../../CDHW_ag/Data/countries_shp/ne_110m_admin_0_countries.shp")
 
-BASELINE_START = "1980"
-BASELINE_END   = "2024"
-YEAR           = "2018"
+# ── Parameters ────────────────────────────────────────────────────────────────
+YEAR         = 2018
+ROLLING_DAYS = 4
+W_WIND       = 0.6
+W_SOLAR      = 0.4
 
-#%%
-# Load full time series
+# ── Plot colours ──────────────────────────────────────────────────────────────
+COLOR_CF   = '#0A8A64'   #    — combined CF
+COLOR_T2M  = '#C00000'   #     — air temperature
+COLOR_SMDI = '#3B5BA5'   #   — soil moisture deficit
+COLOR_SVDI = '#C00000'   #   — VPD index
+
+# %%
+# ── Load Zarr stores ──────────────────────────────────────────────────────────
 print("Opening Zarr stores...")
-ssdi = xr.open_zarr(ssdi_path, consolidated=True, chunks={})
-swdi = xr.open_zarr(swdi_path, consolidated=True, chunks={})
-smdi = xr.open_zarr(smdi_path, consolidated=True, chunks={})
-svdi = xr.open_zarr(svdi_path, consolidated=True, chunks={})
+cf_wind_ds  = xr.open_zarr(cf_wind_path,  consolidated=True, chunks={})
+cf_solar_ds = xr.open_zarr(cf_solar_path, consolidated=True, chunks={})
+era5_ds     = xr.open_zarr(era5_path,     consolidated=True, chunks={})
+smdi_ds     = xr.open_zarr(smdi_path,     consolidated=True, chunks={})
+svdi_ds     = xr.open_zarr(svdi_path,     consolidated=True, chunks={})
+
+cf_wind_da  = cf_wind_ds['CF_wind']
+cf_solar_da = cf_solar_ds['CF_solar']
+t2m_da      = era5_ds['t2m']
+smdi_da     = smdi_ds[list(smdi_ds.data_vars)[0]]
+svdi_da     = svdi_ds[list(svdi_ds.data_vars)[0]]
+
 countries_gdf = gpd.read_file(countries_path)
 
-#%%
-
-# Extract the data variable from each Dataset 
-# Adjust variable names below if your Zarr stores use different keys
-ssdi_da = ssdi[list(ssdi.data_vars)[0]]
-swdi_da = swdi[list(swdi.data_vars)[0]]
-smdi_da = smdi[list(smdi.data_vars)[0]]
-svdi_da = svdi[list(svdi.data_vars)[0]]
- 
-#%%
-
-# Clip to Netherlands and spatially average
-nl_geom = (
-    countries_gdf[countries_gdf["SOVEREIGNT"] == "Netherlands"]
-    .dissolve()
-)
+# %%
+# ── Clip to NL and spatially average ─────────────────────────────────────────
+nl_geom = countries_gdf[countries_gdf["SOVEREIGNT"] == "Netherlands"].dissolve()
 
 def nl_mean(da: xr.DataArray) -> xr.DataArray:
-    """Clip to NL boundary and return unweighted spatial mean (1-D time series)."""
+    """Clip to NL interior cells (all_touched=False) and return spatial mean."""
     clipped = (
         da
         .rio.set_spatial_dims(x_dim="longitude", y_dim="latitude")
         .rio.write_crs("EPSG:4326")
-        .rio.clip(nl_geom.geometry, nl_geom.crs, all_touched=True)
+        .rio.clip(nl_geom.geometry, nl_geom.crs, all_touched=False)
     )
     return clipped.mean(dim=["latitude", "longitude"])
 
 print("Clipping and averaging over the Netherlands...")
-ssdi_nl = nl_mean(ssdi_da)
-swdi_nl = nl_mean(swdi_da)
-smdi_nl = nl_mean(smdi_da)
-svdi_nl = nl_mean(svdi_da)
+cf_wind_nl  = nl_mean(cf_wind_da).compute()
+cf_solar_nl = nl_mean(cf_solar_da).compute()
+t2m_nl      = nl_mean(t2m_da).compute()
+smdi_nl     = nl_mean(smdi_da).compute()
+svdi_nl     = nl_mean(svdi_da).compute()
 
-#%%
-# Select 2018 and compute 
-print("Selecting 2018...")
-ssdi_2018 = ssdi_nl.sel(time=YEAR).compute().values.astype(float)
-swdi_2018 = swdi_nl.sel(time=YEAR).compute().values.astype(float)
-smdi_2018 = smdi_nl.sel(time=YEAR).compute().values.astype(float)
-svdi_2018 = svdi_nl.sel(time=YEAR).compute().values.astype(float)
-#%%
-# Shared daily datetime index (use any one variable — all share the same time axis)
-dates = pd.DatetimeIndex(ssdi_nl.sel(time=YEAR).time.values)
- 
-# 30-day centred moving average 
-WINDOW = 30   # days
- 
-def moving_avg(arr: np.ndarray, window: int = WINDOW) -> np.ndarray:
-    """Centred uniform moving average; NaN-safe via pandas."""
-    return (
-        pd.Series(arr)
-        .rolling(window=window, center=True, min_periods=window // 2)
-        .mean()
-        .values
-    )
+# %%
+# ── Combined CF and daily means ───────────────────────────────────────────────
+CF_comb_nl    = W_WIND * cf_wind_nl + W_SOLAR * cf_solar_nl
+CF_comb_daily = CF_comb_nl.resample(time='1D').mean()
+t2m_daily     = t2m_nl.resample(time='1D').mean()
+# SMDI and SVDI are already daily
 
-ssdi_ma = moving_avg(ssdi_2018)
-swdi_ma = moving_avg(swdi_2018)
-smdi_ma = moving_avg(smdi_2018)
-svdi_ma = moving_avg(svdi_2018)
-#%%
-#  
-#  Colours (matching slide deck) 
-C_TEAL  = "#0A8A64"   # SMDI — soil moisture
-C_CORAL = "#C14B2A"   # SVDI — temperature / VPD
-C_WIND  = "#3A5FA0"   # SWDI — wind CF
-C_SOLAR = "#C49A00"   # SSDI — solar CF
-C_AMBER = "#C47D00"   # dunkelflaute window shading
-C_NAVY  = "#1F3060"
-C_GRAY  = "#888888"
- 
-ALPHA_DAILY = 0.18    # opacity for raw daily lines
-ALPHA_SHADE = 0.15    # background window shading
- 
-# ── Highlight windows ─────────────────────────────────────────────────
-jja_start  = pd.Timestamp("2018-06-01")
-jja_end    = pd.Timestamp("2018-08-31")
-dunk_start = pd.Timestamp("2018-04-23")
-dunk_end   = pd.Timestamp("2018-05-07")
- 
-# ── Figure ────────────────────────────────────────────────────────────
-fig, ax = plt.subplots(figsize=(9.2, 3.70), dpi=180)
-fig.patch.set_facecolor("white")
-ax.set_facecolor("white")
- 
-# Background event shading
-ax.axvspan(jja_start,  jja_end,  alpha=ALPHA_SHADE,        color=C_TEAL,  zorder=0)
-ax.axvspan(dunk_start, dunk_end, alpha=ALPHA_SHADE + 0.05, color=C_AMBER, zorder=0)
- 
-# Zero reference and ±1σ guides
-ax.axhline(0,  color="#CCCCCC", linewidth=0.8, zorder=1)
-ax.axhline( 1, color="#E2E2E2", linewidth=0.5, linestyle="--", zorder=1)
-ax.axhline(-1, color="#E2E2E2", linewidth=0.5, linestyle="--", zorder=1)
- 
-# ── Daily lines (faint) ───────────────────────────────────────────────
-ax.plot(dates, smdi_2018, color=C_TEAL,  linewidth=0.6, alpha=ALPHA_DAILY, zorder=2)
-ax.plot(dates, svdi_2018, color=C_CORAL, linewidth=0.6, alpha=ALPHA_DAILY, zorder=2)
-ax.plot(dates, swdi_2018, color=C_WIND,  linewidth=0.6, alpha=ALPHA_DAILY, zorder=2)
-ax.plot(dates, ssdi_2018, color=C_SOLAR, linewidth=0.6, alpha=ALPHA_DAILY, zorder=2)
- 
-# ── 30-day moving averages (bold) ─────────────────────────────────────
-ax.plot(dates, smdi_ma, color=C_TEAL,  linewidth=2.1, zorder=3)
-ax.plot(dates, svdi_ma, color=C_CORAL, linewidth=2.1, zorder=3)
-ax.plot(dates, swdi_ma, color=C_WIND,  linewidth=1.9, linestyle="--",        zorder=3)
-ax.plot(dates, ssdi_ma, color=C_SOLAR, linewidth=1.9, linestyle=(0, (5, 2)), zorder=3)
- 
-# Directional fills under/over zero for moving averages
-ax.fill_between(dates, smdi_ma, 0, where=(smdi_ma < 0), alpha=0.14, color=C_TEAL,  zorder=2)
-ax.fill_between(dates, svdi_ma, 0, where=(svdi_ma > 0), alpha=0.10, color=C_CORAL, zorder=2)
- 
-# Compound fill: where BOTH wind and solar moving averages are negative
-both_neg = (swdi_ma < 0) & (ssdi_ma < 0)
-ax.fill_between(dates, np.fmin(swdi_ma, ssdi_ma), 0,
-                where=both_neg, alpha=0.20, color=C_AMBER, zorder=2)
- 
-# ── Annotations ───────────────────────────────────────────────────────
-ax.annotate(
-    "Compound drought-heat\n(JJA — agricultural window)",
-    xy=(pd.Timestamp("2018-07-20"), ax.get_ylim()[1] * 0.88),
-    fontsize=7.5, color=C_TEAL, fontweight="bold",
-    ha="center", va="top",
-    bbox=dict(boxstyle="round,pad=0.25", fc="white", ec=C_TEAL, lw=0.7, alpha=0.93)
+# %%
+# DOY climatology (full record) for CF_comb and t2m 
+def doy_clim(da: xr.DataArray):
+    """DOY mean and std arrays (length 365) from a daily DataArray."""
+    grp  = da.assign_coords(doy=da.time.dt.dayofyear).groupby('doy')
+    mean = grp.mean().values[:365]
+    std  = grp.std().values[:365]
+    return mean, std
+
+clim_cf_mean,  clim_cf_std  = doy_clim(CF_comb_daily)
+clim_t2m_mean, clim_t2m_std = doy_clim(t2m_daily)
+
+clim_years = (
+    int(CF_comb_daily.time.dt.year.min()),
+    int(CF_comb_daily.time.dt.year.max()),
 )
- 
-ax.annotate(
-    "Dunkelflaute — wind AND\nsolar collapse together\n(30 Apr 2018)",
-    xy=(pd.Timestamp("2018-04-30"), ax.get_ylim()[0] * 0.82),
-    fontsize=7.2, color=C_AMBER, fontweight="bold",
-    ha="center", va="bottom",
-    bbox=dict(boxstyle="round,pad=0.25", fc="white", ec=C_AMBER, lw=0.7, alpha=0.93)
-)
- 
-# ── ±1σ labels ────────────────────────────────────────────────────────
-ax.text(dates[-1] + pd.Timedelta(days=3),  1.02, "±1σ",
-        fontsize=6.5, color="#BBBBBB", va="bottom")
-ax.text(dates[-1] + pd.Timedelta(days=3), -1.08, "±1σ",
-        fontsize=6.5, color="#BBBBBB", va="top")
- 
-# ── Axes ──────────────────────────────────────────────────────────────
-ax.set_xlim(dates[0] - pd.Timedelta(days=4), dates[-1] + pd.Timedelta(days=14))
-ax.set_ylabel("Normalised anomaly (σ)", fontsize=8.5, color=C_NAVY, labelpad=6)
+
+# %%
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def sel_months(da: xr.DataArray, year: int, months) -> xr.DataArray:
+    mask = (da.time.dt.year == year) & (da.time.dt.month.isin(months))
+    return da.sel(time=mask)
+
+def z_score(values: np.ndarray, doy: np.ndarray,
+            mean: np.ndarray, std: np.ndarray) -> np.ndarray:
+    idx = doy - 1   # DOY is 1-based
+    return (values - mean[idx]) / std[idx]
+
+def smooth(arr: np.ndarray, w: int) -> np.ndarray:
+    return pd.Series(arr).rolling(w, center=True, min_periods=1).mean().values
+
+def month_ticks(year: int, months):
+    return [pd.Timestamp(year, m, 1) for m in months]
+
+# %%
+# ── Compute z-scores for full year 2018 ──────────────────────────────────────
+cf_full   = sel_months(CF_comb_daily, YEAR, range(1, 13))
+t2m_full  = sel_months(t2m_daily,     YEAR, range(1, 13))
+smdi_full = sel_months(smdi_nl,        YEAR, range(1, 13))
+svdi_full = sel_months(svdi_nl,        YEAR, range(1, 13))
+
+doy_full  = cf_full.time.dt.dayofyear.values
+time_full = cf_full.time.values
+
+z_cf_full  = smooth(z_score(cf_full.values,  doy_full, clim_cf_mean,  clim_cf_std),  ROLLING_DAYS)
+z_t2m_full = smooth(z_score(t2m_full.values, doy_full, clim_t2m_mean, clim_t2m_std), ROLLING_DAYS)
+smdi_full_s = smooth(smdi_full.values, ROLLING_DAYS)
+svdi_full_s = smooth(svdi_full.values, ROLLING_DAYS)
+
+# %%
+# ════════════════════════════════════════════════════════════════════
+# FIGURE 1 — Full year 2018, all four variables, no shading
+# ════════════════════════════════════════════════════════════════════
+fig1, ax = plt.subplots(figsize=(16, 5))
+
+ax.axhline(0, color='black', linewidth=0.8, alpha=0.5)
+
+ax.plot(time_full, z_cf_full,   color=COLOR_CF,   linewidth=1.6,
+        label=f'CF_comb z-score')
+ax.plot(time_full, z_t2m_full,  color=COLOR_T2M,  linewidth=1.6,
+        label=f't2m z-score')
+ax.plot(time_full, smdi_full_s, color=COLOR_SMDI, linewidth=1.6,
+        label='SMDI')
+ax.plot(time_full, svdi_full_s, color=COLOR_SVDI, linewidth=1.6,
+        label='SVDI')
+
 ax.xaxis.set_major_locator(mdates.MonthLocator())
-ax.xaxis.set_major_formatter(mdates.DateFormatter("%b"))
-ax.tick_params(axis="x", labelsize=8.5, colors=C_NAVY)
-ax.tick_params(axis="y", labelsize=8,   colors=C_GRAY)
-for spine in ax.spines.values():
-    spine.set_color("#DDDDDD")
-    spine.set_linewidth(0.6)
- 
-# ── Legend ────────────────────────────────────────────────────────────
-agri_sm  = mpatches.Patch(color=C_TEAL,  label="Soil moisture anomaly (SMDI)")
-agri_vpd = mpatches.Patch(color=C_CORAL, label="Temperature / VPD anomaly (SVDI)")
-en_wind  = mlines.Line2D([], [], color=C_WIND,  linewidth=1.9,
-                         linestyle="--",        label="Wind CF anomaly (SWDI)")
-en_solar = mlines.Line2D([], [], color=C_SOLAR, linewidth=1.9,
-                         linestyle=(0, (5, 2)), label="Solar CF anomaly (SSDI)")
-sep      = mpatches.Patch(color="none", label=" ")
- 
-ax.legend(
-    handles=[agri_sm, agri_vpd, sep, en_wind, en_solar],
-    fontsize=7.5, loc="upper left", ncol=1,
-    framealpha=0.93, edgecolor="#DDDDDD",
-    handlelength=1.8, handletextpad=0.6, labelspacing=0.30,
-    title="— bold: 30-day moving avg  · faint: daily",
-    title_fontsize=6.5
+ax.xaxis.set_major_formatter(mdates.DateFormatter('%b'))
+ax.set_xlim(time_full[0], time_full[-1])
+ax.set_ylim(-4, 4)
+ax.set_ylabel('Standardised index / z-score  [ ]')
+ax.legend(fontsize=9, loc='lower right', ncol=4)
+ax.grid(True, alpha=0.2, linestyle='--')
+ax.set_title(
+    f'{YEAR} — CF_comb & t2m z-scores, SMDI, SVDI — Netherlands spatial mean\n'
+    f'CF climatology: {clim_years[0]}–{clim_years[1]}  |  '
+    f'{ROLLING_DAYS}-day rolling smooth',
+    fontsize=12, fontweight='bold'
 )
- 
-# ── Source note ───────────────────────────────────────────────────────
-ax.text(0.01, -0.13,
-        "ERA5-derived daily anomalies, Netherlands 2018  "
-        "· Bold lines = 30-day centred moving average  · Faint = daily values",
-        transform=ax.transAxes, fontsize=5.8, color="#AAAAAA", style="italic")
- 
-plt.tight_layout(pad=0.4)
- 
-out_path = Path("./chart_2018_real.png")
-fig.savefig(out_path, dpi=180, bbox_inches="tight", facecolor="white")
-print(f"Chart saved to {out_path}")
+plt.tight_layout()
 plt.show()
- 
 
+# %%
+# ════════════════════════════════════════════════════════════════════
+# FIGURE 2 — Jan–Jun 2018, CF_comb & t2m z-scores, co-occurrence shading
+# ════════════════════════════════════════════════════════════════════
+cf_H1   = sel_months(CF_comb_daily, YEAR, range(1, 7))
+t2m_H1  = sel_months(t2m_daily,     YEAR, range(1, 7))
 
+doy_H1  = cf_H1.time.dt.dayofyear.values
+time_H1 = cf_H1.time.values
 
+z_cf_H1  = smooth(z_score(cf_H1.values,  doy_H1, clim_cf_mean,  clim_cf_std),  ROLLING_DAYS)
+z_t2m_H1 = smooth(z_score(t2m_H1.values, doy_H1, clim_t2m_mean, clim_t2m_std), ROLLING_DAYS)
+both_neg = (z_cf_H1 < 0) & (z_t2m_H1 < 0)
 
+fig2, ax = plt.subplots(figsize=(14, 5))
 
+ax.fill_between(time_H1, -4, 4, where=both_neg,
+                color='#FAE08A', alpha=0.8, linewidth=0,
+                label='Energy Shortfall')
+ax.axhline(0, color='black', linewidth=0.8, alpha=0.5)
+ax.plot(time_H1, z_t2m_H1, color=COLOR_T2M, alpha = 0.75, linewidth=3.0, label='Temperature Anom.')
+ax.plot(time_H1, z_cf_H1,  color=COLOR_CF,  linewidth=3.0, label='Renewable Generation Anom.')
 
+for tick in month_ticks(YEAR, range(1, 7)):
+    ax.axvline(tick, color='gray', linewidth=0.8, linestyle='--', alpha=0.5)
 
+ax.xaxis.set_major_locator(mdates.MonthLocator())
+ax.xaxis.set_major_formatter(mdates.DateFormatter('%b'))
+ax.set_xlim(time_H1[0], time_H1[-1])
+ax.set_ylim(-4, 4)
+ax.set_ylabel('Deviation from mean  [ ]')
+ax.legend(fontsize=14, loc='lower right')
+ax.grid(True, alpha=0.9, linestyle='--')
+# ax.set_title(
+#     f'Jan–Jun {YEAR} — Combined CF & t2m standardised anomalies — Netherlands\n'
+#     f'CF climatology: {clim_years[0]}–{clim_years[1]}  |  '
+#     f'{ROLLING_DAYS}-day rolling smooth',
+#     fontsize=12, fontweight='bold'
+# )
+plt.tight_layout()
+plt.show()
 
+# %%
+# ════════════════════════════════════════════════════════════════════
+# FIGURE 3 — Apr–Sep 2018, SMDI & SVDI, compound stress shading
+# Shading: SMDI < 0 (soil moisture deficit) AND SVDI > 0 (VPD excess)
+# ════════════════════════════════════════════════════════════════════
+smdi_H2 = sel_months(smdi_nl, YEAR, range(4, 10))
+svdi_H2 = sel_months(svdi_nl, YEAR, range(4, 10))
 
+time_H2  = smdi_H2.time.values
+smdi_H2_s = smooth(smdi_H2.values, 1)
+svdi_H2_s = smooth(svdi_H2.values, ROLLING_DAYS)
+compound  = (smdi_H2_s < 0) & (svdi_H2_s > 0)
 
+fig3, ax = plt.subplots(figsize=(14, 5))
 
+ax.fill_between(time_H2, -4, 4, where=compound,
+                color='#FAE08A', alpha=0.8, linewidth=0,
+                label='Crop stressed')
+ax.axhline(0, color='black', linewidth=0.8, alpha=0.5)
+ax.plot(time_H2, smdi_H2_s, color=COLOR_SMDI, linewidth=3.0, label='Soil Water')
+ax.plot(time_H2, svdi_H2_s, color=COLOR_SVDI, linewidth=3.0, label='Heat Stress')
 
+for tick in month_ticks(YEAR, range(4, 10)):
+    ax.axvline(tick, color='gray', linewidth=0.8, linestyle='--', alpha=0.5)
 
-
-
+ax.xaxis.set_major_locator(mdates.MonthLocator())
+ax.xaxis.set_major_formatter(mdates.DateFormatter('%b'))
+ax.set_xlim(time_H2[0], time_H2[-1])
+ax.set_ylim(-4, 4)
+ax.set_ylabel('Deviation from mean  [ ]')
+ax.legend(fontsize=14, loc='lower left')
+ax.grid(True, alpha=0.2, linestyle='--')
+# ax.set_title(
+#     f'Apr–Sep {YEAR} — SMDI & SVDI — Netherlands spatial mean\n'
+#     f'{ROLLING_DAYS}-day rolling smooth',
+#     fontsize=12, fontweight='bold'
+# )
+plt.tight_layout()
+plt.show()
 
 # %%
