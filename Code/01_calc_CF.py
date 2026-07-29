@@ -31,7 +31,7 @@ that hour, which is the physically correct input to the PV model.
 
 Inputs
 ------
-  $ERA5_dat/temps_df/processed/temps_df_cleaned.zarr
+  $ERA5_dat/df_dat/processed/df_dat_cleaned.zarr
       Variables: u100, v100 (m/s); ssrd (J/m²/hour); t2m (K)
 
 Outputs
@@ -45,8 +45,8 @@ Next step
 
 References
 ----------
-  Brown et al. (2021) https://doi.org/10.1007/s42452-021-04794-z
-  Bett & Thornton (2016) 10.1016/j.renene.2015.10.006
+  Brown et al. (2021) 
+  Bett & Thornton (2016) 
 
 @author: afer
 """
@@ -98,11 +98,6 @@ LON_CHUNK = 10
 # Produced by 00b_ETL_nc_to_zarr.py; contains u100, v100, ssrd, t2m, u10 and v10
 
 era5_dat = os.environ.get("ERA5_dat")
-if era5_dat is None:
-    raise EnvironmentError(
-        "Environment variable 'ERA5_dat' is not set.\n"
-        "Add it to ~/.bashrc:  export ERA5_dat=/path/to/era5_data"
-    )
 
 zarr_path = Path(era5_dat) / "df_dat" / "processed" / "df_dat_cleaned.zarr"
 print(f"Loading ERA5 Zarr store: {zarr_path}")
@@ -157,7 +152,7 @@ def power_curve_polynomial(ws):
 
     Reference
     ---------
-    Brown et al. (2021), https://doi.org/10.1007/s42452-021-04794-z
+    Brown et al. (2021)
     """
     return (  634.228
             - 1248.5    * ws
@@ -188,7 +183,7 @@ CF_wind.attrs.update({
     'valid_range' : [0, 1],
     'turbine'     : 'Vestas V90-2.0 MW; P_rated=2000 kW; cut-in=3 m/s; '
                     'rated=13 m/s; cut-out=25 m/s',
-    'reference'   : 'Brown et al. (2021), doi:10.1016/j.energy.2021.120034',
+    'reference'   : 'Brown et al. (2021)',
 })
 
 print(f"\nCF_wind computed (lazy) — shape: {CF_wind.shape}")

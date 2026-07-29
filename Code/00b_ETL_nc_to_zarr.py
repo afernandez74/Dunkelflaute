@@ -60,15 +60,16 @@ INPUT_FOLDER = "df_dat"
 # Fallback short-name map used when a variable's 'short_name' attribute is
 # absent.  Keys are ARCO-ERA5 long names; values are CF short names.
 SHORT_NAME_MAP: dict[str, str] = {
-    "10m_u_component_of_wind":            "u10",
-    "10m_v_component_of_wind":            "v10",
+    # "10m_u_component_of_wind":            "u10",
+    # "10m_v_component_of_wind":            "v10",
     "100m_u_component_of_wind":           "u100",
     "100m_v_component_of_wind":           "v100",
     "surface_solar_radiation_downwards":  "ssrd",
     "2m_temperature":                     "t2m",
+    "geopotential":         "z",
     # Additional variables kept for completeness (not downloaded by default)
-    "2m_dewpoint_temperature":            "d2m",
-    "10m_wind_speed":                     "si10",
+    # "2m_dewpoint_temperature":            "d2m",
+    # "10m_wind_speed":                     "si10",
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -200,3 +201,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+# %%

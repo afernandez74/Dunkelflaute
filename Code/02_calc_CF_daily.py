@@ -56,7 +56,7 @@ CF_solar_zarr = Path('./../Results/CF_solar/CF_solar_hrly.zarr')
 print(f"Loading CF_wind  : {CF_wind_zarr}")
 print(f"Loading CF_solar : {CF_solar_zarr}")
 
-# Extract dataarrays
+# Extract dataarrays preserving native on-disk chunking
 CF_wind_hr  = xr.open_zarr(CF_wind_zarr,  consolidated=True, chunks={})['CF_wind']
 CF_solar_hr = xr.open_zarr(CF_solar_zarr, consolidated=True, chunks={})['CF_solar']
 
@@ -67,49 +67,32 @@ print(f"  time: {str(CF_solar_hr.time.values[0])[:10]} → {str(CF_solar_hr.time
 
 
 #%%
-# Daily aggregation 
-# Chunking strategy: rechunk to a large time block before resampling so that
-# each Dask task covers ~5 years of hourly data per spatial column.  
-
-CHUNK_HOURLY = 8_760 # 1 year
-CHUNK_LAT = 10
-CHUNK_LON = 10
+# Daily aggregation via coarsen
 
 # 1. Daily mean wind CF — 24-hour mean
 CF_wind_dly = (
     CF_wind_hr
-    .chunk({'time': CHUNK_HOURLY, 'latitude': CHUNK_LAT, 'longitude': CHUNK_LON})
-    .resample(time='1D')
+    .coarsen(time=24, boundary='trim', coord_func='min')
     .mean()
 )
 
 # 2. Daily mean solar CF — 24-hour average 
+solar = CF_solar_hr
+
 CF_solar_24h_dly = (
-    CF_solar_hr
-    .chunk({'time': CHUNK_HOURLY, 'latitude': CHUNK_LAT, 'longitude': CHUNK_LON})
-    .resample(time='1D')
+    solar
+    .coarsen(time=24, boundary='trim', coord_func='min')
     .mean()
 )
 
 # 3. Daily mean solar CF — daytime hours only (CF_solar > 0)
+solar_masked = solar.where(solar > 0)
+
 CF_solar_daytime_dly = (
-    CF_solar_hr.where(CF_solar_hr > 0)
-    .chunk({'time': CHUNK_HOURLY, 'latitude': CHUNK_LAT, 'longitude': CHUNK_LON})
-    .resample(time='1D')
+    solar_masked
+    .coarsen(time=24, boundary='trim', coord_func='min')
     .mean()
 )
-
-# Trigger all three computations in parallel
-print("\nTriggering Dask computation (this may take several minutes)…")
-
-print("computing CF wind mean daily values...")
-CF_wind_dly          = CF_wind_dly.compute()
-print("computing CF solar mean daily values...")
-CF_solar_24h_dly     = CF_solar_24h_dly.compute()
-print("computing CF solar mean daytime-only values...")
-CF_solar_daytime_dly = CF_solar_daytime_dly.compute()
-
-print("Computation complete.")
 
 print(f"\n  CF_wind_dly          — shape: {CF_wind_dly.shape}")
 print(f"  CF_solar_24h_dly     — shape: {CF_solar_24h_dly.shape}")
@@ -138,6 +121,31 @@ CF_solar_daytime_dly.attrs.update({
     'note'      : 'Input to delta optimisation in 04_DF_ID.py; '
                   'NaN on days with no generating hours',
 })
+
+
+#%%
+# Save daily CFs to Zarr 
+# Writing directly to disk triggers Dask computations safely in chunks
+# without blowing up system memory.
+
+out_dir = Path('./../Results/CF_daily')
+out_dir.mkdir(parents=True, exist_ok=True)
+
+out_paths = {
+    'CF_wind_daily'         : (CF_wind_dly,          out_dir / 'CF_wind_daily.zarr'),
+    'CF_solar_24h_daily'    : (CF_solar_24h_dly,     out_dir / 'CF_solar_24h_daily.zarr'),
+    'CF_solar_daytime_daily': (CF_solar_daytime_dly, out_dir / 'CF_solar_daytime_daily.zarr'),
+}
+
+print("\nComputing and streaming results to disk...")
+for name, (da, path) in out_paths.items():
+    print(f"Saving {name} → {path}")
+    da.to_dataset().to_zarr(path, mode='w', consolidated=True)
+    print("  Done.")
+
+print("\nAll daily CF Zarr stores saved successfully:")
+for name, (_, path) in out_paths.items():
+    print(f"  {name}: {path}")
 
 
 #%%
@@ -294,34 +302,3 @@ plt.suptitle('ERA5 time-mean daily capacity factors — full record',
              fontsize=12, fontweight='bold')
 plt.tight_layout()
 plt.show()
-
-
-#%%
-# Save daily CFs to Zarr 
-# Three separate Zarr stores — one per aggregate — consumed by
-# 03_calc_SWDI_SSDI.py (wind + solar 24h) and 04_DF_ID.py (solar daytime).
-# Rechunked to full time axis per spatial tile for efficient time-series reads.
-
-out_dir = Path('./../Results/CF_daily')
-out_dir.mkdir(parents=True, exist_ok=True)
-
-out_paths = {
-    'CF_wind_daily'         : (CF_wind_dly,          out_dir / 'CF_wind_daily.zarr'),
-    'CF_solar_24h_daily'    : (CF_solar_24h_dly,     out_dir / 'CF_solar_24h_daily.zarr'),
-    'CF_solar_daytime_daily': (CF_solar_daytime_dly, out_dir / 'CF_solar_daytime_daily.zarr'),
-}
-
-for name, (da, path) in out_paths.items():
-    da_save = (
-        da
-        .chunk({'time': -1, 'latitude': CHUNK_LAT, 'longitude': CHUNK_LON})
-        .to_dataset()   # wrap DataArray → Dataset for clean Zarr variable naming
-    )
-    print(f"Saving {name} → {path}")
-    da_save.to_zarr(path, mode='w', consolidated=True)
-    print(f"  Done.")
-
-print("\nAll daily CF Zarr stores saved successfully:")
-for name, (_, path) in out_paths.items():
-    print(f"  {name}: {path}")
-

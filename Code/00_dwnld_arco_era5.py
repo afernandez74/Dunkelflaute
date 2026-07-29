@@ -15,7 +15,7 @@ Geographic domain:
   extended by a 200 km offshore buffer in all coastal directions:
       200 km ≈ 1.8° latitude
       200 km ≈ 2.9° longitude (at mid-domain latitude ~48°N)
-  Resulting domain: N57, W8, S39, E19  — covers the Netherlands, Belgium,
+  Resulting domain: N62, W14, S42, E18  — covers the Netherlands, Belgium,
   Germany, France, Denmark, and adjacent North Sea / Atlantic / Mediterranean
   offshore zones required for offshore wind resource assessment.
 
@@ -81,7 +81,7 @@ PRESSURE_LEVEL = 500
 
 # Z = geopotential / g.  True → store as height `z` in metres; False → raw geopotential.
 CONVERT_TO_GEOPOTENTIAL_HEIGHT = True
-G0 = 9.80 
+G0 = 9.80665
 
 # Output directory — NetCDF files written here, one per year
 # Uses the same ERA5_dat env var as the 'ag' subproject, but a separate
@@ -304,7 +304,8 @@ def main() -> None:
     )
 
     # Chunk along time for efficient streaming reads from GCS
-    ds = ds.chunk({"time": 24})
+    
+    ds = ds.chunk({"time": 24, "latitude": ds.sizes["latitude"], "longitude": ds.sizes["longitude"]})
 
     # ── Download ─────────────────────────────────────────────────────────────
     if args.year is not None:

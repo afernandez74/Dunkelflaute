@@ -48,7 +48,7 @@ CF_solar_24h_dly = xr.open_zarr(CF_DAILY_DIR / 'CF_solar_24h_daily.zarr',
 CF_wind_dly      = CF_wind_dly.compute()
 CF_solar_24h_dly = CF_solar_24h_dly.compute()
 
-print(f"CF_wind_dly      — shape: {CF_wind_dly.shape}")
+print(f"CF_wind_dly— shape: {CF_wind_dly.shape}")
 print(f"CF_solar_24h_dly — shape: {CF_solar_24h_dly.shape}")
 print(f"Time: {str(CF_wind_dly.time.values[0])[:10]} → {str(CF_wind_dly.time.values[-1])[:10]}")
 
@@ -211,8 +211,6 @@ event_mask = identify_events(CF_norm, threshold,
 n_event_days = int(event_mask.sum())
 print(f"  Total event days (all cells): {n_event_days:,}")
 print(f"  Fraction of all cell-days  : {float(event_mask.mean())*100:.2f}%")
-
-event_count_da, return_period_da = compute_event_stats(event_mask)
 
 yr0     = int(CF_sys.time.dt.year.min().values)
 yr1     = int(CF_sys.time.dt.year.max().values)
