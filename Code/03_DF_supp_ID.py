@@ -3,44 +3,17 @@
 """
 03_DF_supply_ID.py
 ==================
-Supply-side dunkelflaute detection on raw combined capacity factors
+Supply-side dunkelflaute detection on combined capacity factors from ERA5 reanalysis
+
 (Otero et al. 2022 "low wind and solar production" events; cf. Raynaud et al.
 2018, Meng et al. 2025).
 
 Purely meteorological: events are periods of low *potential* generation.
-Absolute installed capacity (MW) cancels out of percentile-based detection;
-only the dimensionless wind/solar mix weight enters (capacity shares).
 
-    CF_sys = W_WIND * CF_wind + W_SOLAR * CF_solar_24h
-
-Detection grammar:
-    within-NDJFM percentile threshold (lower tail)
-    -> flag on the FULL daily index masked to winter
-       (never on a season-subset array: runs must not bridge Mar -> Nov)
-    -> gap pooling (events separated by >= 2 days are distinct; Otero'22)
-    -> minimum duration filter
-    -> severity = summed standardized threshold shortfall (Otero'22)
-
-Two tracks:
-    A. Per-cell   : threshold per grid cell -> frequency / severity maps
-                    (spatial climatology; CDHW Fig 2 analog)
-    B. Per-country: buffered-mask country-mean CF_sys -> event catalogue
-                    + annual aggregates (analog of planned RL outputs)
-
-Country masks include a coastal buffer (~200 km) so offshore cells are
-assigned to their nearest country -- offshore wind included by design.
-
-Inputs
-------
-  ./../Results/CF_daily/CF_wind_daily.zarr        (02_calc_CF_daily.py)
-  ./../Results/CF_daily/CF_solar_24h_daily.zarr   (02_calc_CF_daily.py)
-  ~/CDHW_ag/Data/countries/ne_10m_admin_0_countries.shp
-
-Outputs
--------
-  ./../Results/DF_supply/df_supply_cell_stats.nc      per-cell climatology
-  ./../Results/DF_supply/df_supply_events.parquet     one row per event
-  ./../Results/DF_supply/df_supply_annual.parquet     one row per (country, winter), zero-filled
+Three country-level tracks: 
+  1. IRENA current-mix relative CF_sys (national capacity share weighting)
+  2. Max potential-weighted relative CF_sys (grid-cell MW weighted, dimensionless)
+  3. Max potential absolute fleet capacity (grid-cell MW weighted, total MW generation)
 
 @author: afer
 """
@@ -64,32 +37,19 @@ import cartopy.feature as cfeature
 
 
 #%%
-# Config 
-
-# Portfolio mix weights (dimensionless capacity SHARES, w + s = 1).
-# TODO: replace with real per-country capacity shares once
-#       Data/installed_capacity.csv is populated (IRENA / ENTSO-E vintage).
-#       Absolute MW is irrelevant for detection; only the mix enters. DONE BELOW
-
-# reference w-solar and w-wind for track A
-REF_W_SOLAR = 0.25
-REF_W_WIND  = 1.0 - REF_W_SOLAR
-CF_sys = (REF_W_WIND * CF_wind_dly + REF_W_SOLAR * CF_solar_dly).rename('CF_sys')
-
+# Config and params
 WINTER_MONTHS = [11, 12, 1, 2, 3]   # extended winter (NDJFM)
-THRESHOLD_PCT = 10                  # lower-tail within-season percentile
-SEVERE_PCT    = 5                   # severe tier (optional flag per event)
-MAX_GAP       = 1                   # Otero'22: events separated by >= 2 days
-                                    # are distinct -> 1-day gaps are pooled
-MIN_DURATION  = 3                   # days; consistent with CDHW filtering
+THRESHOLD_PCT = 10                  # lower-tail within-season percentilen threshold (%)
+SEVERE_PCT    = 5                   # severe tier percentile threshold (%)
+MAX_GAP       = 1                   # Otero'22: events separated by < 2 days are pooled
+MIN_DURATION  = 3                   # Min event duration filter (days)
 
-BUFFER_DEG    = 1.8                 # ~200 km coastal buffer for offshore cells
-                                    # (degrees; anisotropic in lon -- acceptable v1)
-
-
-# Absolute renewable scarcity threshold
-# Days below this system CF are considered absolute supply scarcity events
+# Absolute CF scarcity threshold (system CF floor)
 ABS_CF_THRESHOLD = 0.15
+
+# Spatial parameters
+CAP_VINTAGE = 2024              # IRENA dataset reference year
+
 
 COUNTRIES = {                       # Natural Earth ADMIN name -> code
     "France"        : "FR",         # (ADMIN, not SOVEREIGNT: keeps Greenland
@@ -101,84 +61,233 @@ COUNTRIES = {                       # Natural Earth ADMIN name -> code
     "Ireland"       : "IE",         # Ireland (NI is in IE_SEM). TODO before RL
 }                                   # validation: move NI polygon to IE.
 
-CF_DAILY_DIR  = Path('./../Results/CF_daily')
-OUT_DIR       = Path('./../Results/DF_supply')
+# Input / Output Directories
+CF_DAILY_DIR  = Path('./../Results/CF_daily') # ERA5-based CF data
+OUT_DIR       = Path('./../Results/DF_supply') 
+IC_PATH       = Path('./../Data/IRENA_IC/IC.csv') # IRENA
+POT_PATH      = Path('./../Data/Hu_IC/CF_info_grid.csv') #
 COUNTRIES_SHP = Path('~/CDHW_ag/Data/countries/ne_10m_admin_0_countries.shp').expanduser()
+EEZ_SHP = Path('./../Data/EEZ/World_EEZ_v12_20231025/eez_v12.shp')
 
 OUT_DIR.mkdir(parents=True, exist_ok=True)
-
 #%%
-# load installed capacity data
-IC_PATH = Path('./../Data/IC/IC.csv')
+# load installed capacity data (IRENA and Hu)
+# ====================================================
+# IRENA (national ratios)
+# ====================================================
 IC = pd.read_csv(IC_PATH, index_col=0)
-IC.index = IC.index.map({          # IRENA country names -> your codes
+
+IC.index = IC.index.map({          # IRENA country names -> short EU names
     'France': 'FR', 'Belgium': 'BE', 'Netherlands': 'NL', 'Germany': 'DE',
     'Denmark': 'DK', 'United Kingdom': 'GB', 'Ireland': 'IE',
 })
 
-# Per-country capacity shares of the three sources (sum to 1 within country)
-IC_TOTAL_REN = IC[['Onshore Wind (MW)', 'Offshore Wind (MW)', 'Solar (MW)']].sum(axis=1)
-W = pd.DataFrame({
-    'won':  IC['Onshore Wind (MW)']  / IC_TOTAL_REN,
+# Per-country capacity shares of the three sources
+IC_TOTAL_REN = IC[['Onshore Wind (MW)','Offshore Wind (MW)', 'Solar (MW)']].sum(axis = 1)
+W_irena = pd.DataFrame({
+    'won': IC['Onshore Wind (MW)'] / IC_TOTAL_REN,
     'woff': IC['Offshore Wind (MW)'] / IC_TOTAL_REN,
-    'wsol': IC['Solar (MW)']         / IC_TOTAL_REN,
+    'wsol': IC['Solar (MW)'] / IC_TOTAL_REN
 })
-IC_CAPACITY_TOTAL = IC_TOTAL_REN     # MW, for the eventual GWh severity translation
+print("IRENA 2024 National Capacity Shares:")
+print(W_irena.round(3))
 
-CAP_VINTAGE = 2024
-print("Per-country renewable mix shares (onshore / offshore / solar):")
-print(W.round(3))
+# ====================================================
+# Hu (maximum installable capacity)
+# ====================================================
+pot_raw = pd.read_csv(POT_PATH)[['lon', 'lat', 'potential_onshore', 'potential_offshore', 'potential_PV']]
 
+ds_pot = pot_raw.set_index(['lat','lon']).to_xarray()
+ds_pot = ds_pot.rename({'lat': 'latitude',
+    'lon': 'longitude',
+    'potential_onshore': 'pot_on',
+    'potential_offshore': 'pot_off',
+    'potential_PV': 'pot_pv'})
+        
 #%%
-# Load daily capacity factors, build system CF ─────────────────────────────
-
-CHUNKS = {'time': -1, 'latitude': 20, 'longitude': 20}
-
+# Load daily capacity factors and mask for winter
+# wind daily 
 CF_wind_dly  = xr.open_zarr(CF_DAILY_DIR / 'CF_wind_daily.zarr',
-                            consolidated=True, chunks = {})['CF_wind_dly']
+                            consolidated=True)['CF_wind_dly']
 CF_solar_dly = xr.open_zarr(CF_DAILY_DIR / 'CF_solar_24h_daily.zarr',
-                            consolidated=True, chunks={})['CF_solar_24h_dly']
+                            consolidated=True)['CF_solar_24h_dly']
 
-CF_wind_dly, CF_solar_dly = xr.align(CF_wind_dly, CF_solar_dly, join='inner')
+# align POT grid to ERA5 grid
+pot_grid = ds_pot.reindex(
+    latitude = CF_wind_dly.latitude,
+    longitude = CF_wind_dly.longitude,
+    fill_value = 0.0
+)
 
-CF_sys = (W_WIND * CF_wind_dly + W_SOLAR * CF_solar_dly).rename('CF_sys')
-CF_sys.attrs.update({
-    'long_name'   : 'Combined system capacity factor (potential generation per unit capacity)',
-    'description' : f'{W_WIND:.2f} x CF_wind + {W_SOLAR:.2f} x CF_solar_24h',
-    'units'       : 'dimensionless',
-})
-CF_sys = CF_sys.compute()
+# extract time details
+times    = pd.DatetimeIndex(CF_wind_dly.time.values)
+months    = times.month.values
+years = times.year.values
 
-times    = pd.DatetimeIndex(CF_sys.time.values)
-month    = times.month.values
-n_lat    = CF_sys.sizes['latitude']
-n_lon    = CF_sys.sizes['longitude']
+#define winter labels (nov/dec belong to next year's winter)
+winter_id = np.where(months>=11, years + 1, years)
+is_ndjfm = np.isin(months, WINTER_MONTHS)
 
-print(f"CF_sys — shape: {CF_sys.shape}")
-print(f"  time: {times[0].date()} → {times[-1].date()}")
-print(f"  mix : wind {W_WIND:.2f} / solar {W_SOLAR:.2f}")
-
-
-#%%
-# Winter calendar: labels, and the valid-winter mask ───────────────────────
-# Winter label: Nov/Dec belong to the following year's winter (winter 2010 =
-# Nov 2009 – Mar 2010). 
-
-winter_id = np.where(month >= 11, times.year.values + 1, times.year.values)
-is_ndjfm  = np.isin(month, WINTER_MONTHS)
-
-winters_with_nov = set(winter_id[month == 11])
-winters_with_mar = set(winter_id[month == 3])
+# only complete winters
+winters_with_nov = set(winter_id[months == 11])
+winters_with_mar = set(winter_id[months == 3])
 valid_winters    = sorted(winters_with_nov & winters_with_mar)
 
 winter_ok = is_ndjfm & np.isin(winter_id, valid_winters)
 n_winters = len(valid_winters)
 
-print(f"Complete winters: {n_winters}  ({valid_winters[0]} → {valid_winters[-1]})")
-print(f"Winter days in detection window: {int(winter_ok.sum()):,}")
-
+print(f"\nERA5 Grid domain loaded: {len(times)} days ({times[0].date()} to {times[-1].date()})")
+print(f"Complete winters found: {n_winters} ({valid_winters[0]} -> {valid_winters[-1]})")
 
 #%%
+# Build Country Spatial Masks (Onshore + Coastal Offshore Buffer)
+
+def build_masks(template_da, land_shp_path, eez_shp_path):
+    land_gdf = gpd.read_file(str(land_shp_path))
+    eez_gdf = gpd.read_file(str(eez_shp_path))
+
+    lons, lats = np.meshgrid(template_da.longitude.values, template_da.latitude.values)
+    pts = shapely.points(lons.ravel(), lats.ravel())
+
+    all_land = land_gdf.union_all() # all known land so it's not mistaken for offshore
+    is_any_land = (shapely.distance(all_land, pts) == 0.0).reshape(lats.shape)
+
+    def _to_da(mask_array):
+        return xr.DataArray(
+            mask_array, 
+            coords={'latitude': template_da.latitude, 'longitude': template_da.longitude},
+            dims=['latitude', 'longitude']
+        )
+
+    masks_on, masks_off = {}, {}
+    for name, code in COUNTRIES.items():
+        # ONSHORE MASK
+        land_geom = land_gdf.loc[land_gdf['ADMIN'] == name].union_all()
+        
+        if code == 'FR':  # Exclude Corsica
+            land_geom = land_geom.difference(shapely.geometry.box(8.5, 41.3, 9.6, 43.1))
+            
+        onshore_mask = shapely.within(pts, land_geom).reshape(lats.shape)
+        masks_on[code] = _to_da(onshore_mask)
+
+        # OFFSHORE MASK 
+        eez_geom = eez_gdf.loc[eez_gdf['SOVEREIGN1'] == name].union_all()
+        
+        # Exclude Rockall 
+        if code == 'GB':  
+            eez_geom = eez_geom.difference(shapely.geometry.box(-15.0, 55.0, -10.0, 60.0))
+        if code == 'DK':
+            # Exclude Greenland
+            eez_geom = eez_geom.difference(shapely.geometry.box(-75.0, 58.0, -10.0, 85.0))
+            # Exclude Faroe Islands
+            eez_geom = eez_geom.difference(shapely.geometry.box(-15.0, 59.0, 0.0, 65.0))        
+        in_eez = shapely.within(pts, eez_geom).reshape(lats.shape)
+        
+        # Offshore condition: Must be inside the legal EEZ, but strictly in the water
+        masks_off[code] = _to_da(in_eez & ~is_any_land)
+
+    return masks_on, masks_off
+
+masks_on, masks_off = build_masks(CF_wind_dly.isel(time=0), COUNTRIES_SHP, EEZ_SHP)
+print("\nCountry mask build complete. Onshore / Offshore cell count:")
+for code in COUNTRIES.values():
+    print(f"  {code}: {int(masks_on[code].sum())} onshore / {int(masks_off[code].sum())} offshore cells")
+
+#%%
+# visualize masks 
+import matplotlib.pyplot as plt
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
+import matplotlib.patches as mpatches
+import xarray as xr
+import numpy as np
+
+def plot_country_masks(masks_on, masks_off):
+    """Plots onshore and offshore xarray masks on a Cartopy map."""
+    
+    # 1. Get a template array to initialize the combined map
+    first_code = list(masks_on.keys())[0]
+    template = masks_on[first_code]
+    
+    # Create empty arrays filled with NaNs (transparent background)
+    combined_on = xr.full_like(template, fill_value=np.nan, dtype=float)
+    combined_off = xr.full_like(template, fill_value=np.nan, dtype=float)
+    
+    # 2. Assign a unique integer to each country so they get distinct colors
+    country_codes = list(masks_on.keys())
+    for i, code in enumerate(country_codes, start=1):
+        combined_on = xr.where(masks_on[code], i, combined_on)
+        combined_off = xr.where(masks_off[code], i, combined_off)
+
+    # 3. Set up the Map Projection (PlateCarree is standard for lat/lon data)
+    fig, ax = plt.subplots(figsize=(12, 10), subplot_kw={'projection': ccrs.PlateCarree()})
+
+    # Add real-world map features under the data
+    ax.add_feature(cfeature.OCEAN, facecolor='aliceblue')
+    ax.add_feature(cfeature.LAND, facecolor='whitesmoke')
+    ax.add_feature(cfeature.BORDERS, linewidth=0.5, edgecolor='darkgray')
+    ax.add_feature(cfeature.COASTLINE, linewidth=0.8, edgecolor='black')
+
+    # 4. Plot the Data
+    # Use a discrete colormap ('tab20' is good for categorical distinction)
+    cmap = plt.get_cmap('tab20', len(country_codes))
+    
+    # Plot Offshore (semi-transparent)
+    combined_off.plot(
+        ax=ax,
+        transform=ccrs.PlateCarree(),
+        cmap=cmap,
+        vmin=0.5, vmax=len(country_codes) + 0.5,
+        add_colorbar=False,
+        alpha=0.4  # Transparency distinguishes the offshore buffer
+    )
+
+    # Plot Onshore (fully opaque)
+    combined_on.plot(
+        ax=ax,
+        transform=ccrs.PlateCarree(),
+        cmap=cmap,
+        vmin=0.5, vmax=len(country_codes) + 0.5,
+        add_colorbar=False,
+        alpha=0.9
+    )
+
+    # 5. Create a Custom Legend
+    legend_patches = []
+    for i, code in enumerate(country_codes):
+        # Extract the exact color used for this country from the colormap
+        color = cmap(i / max(1, len(country_codes) - 1))
+        
+        # Add a patch for both the solid onshore and transparent offshore
+        legend_patches.append(mpatches.Patch(color=color, label=f'{code} Onshore'))
+        legend_patches.append(mpatches.Patch(color=color, alpha=0.4, label=f'{code} Offshore'))
+
+    # Place legend outside the main plot
+    box = ax.get_position()
+    ax.set_position([box.x0, box.y0, box.width * 0.85, box.height])
+    ax.legend(handles=legend_patches, loc='center left', bbox_to_anchor=(1.02, 0.5), 
+              fontsize=9, title="Regions", frameon=True)
+
+    # 6. Final Formatting
+    ax.set_title("Country Energy Spatial Masks (Onshore & Offshore)", fontsize=15, pad=15)
+    
+    # Zoom the map strictly to the bounds of our data grid
+    ax.set_extent([
+        template.longitude.min().item(), template.longitude.max().item(),
+        template.latitude.min().item(), template.latitude.max().item()
+    ], crs=ccrs.PlateCarree())
+
+    # Add Latitude / Longitude gridlines
+    gl = ax.gridlines(draw_labels=True, linewidth=0.5, color='gray', alpha=0.5, linestyle='--')
+    gl.top_labels = False
+    gl.right_labels = False
+
+    plt.show()
+
+# Execute the visualization using the dictionaries created in your script
+plot_country_masks(masks_on, masks_off)
+#%%
+#TODO
 # Detection functions ──────────────────────────────────────────────────────
 
 def merge_and_filter_runs_1d(flag, max_gap, min_duration):
@@ -385,15 +494,6 @@ for i in range(n_lat):
                 [r["duration"] for r in abs_rows]
             )
         
-        
-        freq_arr[i, j] = len(ev_rows) / n_winters
-        if ev_rows:
-            durs = [r['duration']   for r in ev_rows]
-            Ss   = [r['severity_S'] for r in ev_rows]
-            mean_dur_arr[i, j] = np.mean(durs)
-            mean_S_arr[i, j]   = np.mean(Ss)
-            tot_S_yr_arr[i, j] = np.sum(Ss) / n_winters
-
 coords_2d = {'latitude': CF_sys.latitude, 'longitude': CF_sys.longitude}
 
 cell_stats = xr.Dataset(
@@ -550,62 +650,6 @@ cf_country = pd.DataFrame(cf_country, index=times)
 print("\nPer-country CF_sys means (NDJFM):")
 print(cf_country[winter_ok].mean().round(3).to_string())
 
-#%%
-# ─── Track B: per-country detection → event catalogue (relative + absolute) ───
-
-country_codes = list(COUNTRIES.values())
-all_rows      = []
-thresholds    = {}
-event_masks   = {}          # relative-track masks, kept for diagnostics + concurrence
-abs_event_masks = {}        # absolute-track masks
-
-for code in country_codes:
-    x = cf_country[code].values
-
-    # Relative (within-NDJFM percentile) track
-    evt, thr, thr_sev, sigma = detect_events_1d(
-        x, winter_ok, thr_pct=THRESHOLD_PCT, severe_pct=SEVERE_PCT,
-        max_gap=MAX_GAP, min_duration=MIN_DURATION)
-    thresholds[code]  = thr
-    event_masks[code] = evt
-
-    for r in characterize_events_1d(evt, x, thr, thr_sev, sigma):
-        s_idx, e_idx = r.pop('start_idx'), r.pop('end_idx')
-        all_rows.append(dict(
-            country=code, track='relative',
-            start_date=times[s_idx], end_date=times[e_idx],
-            winter=int(winter_id[s_idx]),          # single source of truth
-            thr_cf=float(thr), **r,
-        ))
-
-    # Absolute (fixed CF floor) track
-    abs_evt, abs_thr, _, abs_sigma = detect_events_1d(
-        x, winter_ok, max_gap=MAX_GAP, min_duration=MIN_DURATION,
-        absolute_threshold=ABS_CF_THRESHOLD)
-    abs_event_masks[code] = abs_evt
-
-    for r in characterize_events_1d(abs_evt, x, abs_thr, abs_thr, abs_sigma):
-        r.pop('is_severe')                          # meaningless when thr_sev == thr
-        s_idx, e_idx = r.pop('start_idx'), r.pop('end_idx')
-        all_rows.append(dict(
-            country=code, track='absolute',
-            start_date=times[s_idx], end_date=times[e_idx],
-            winter=int(winter_id[s_idx]),
-            thr_cf=float(ABS_CF_THRESHOLD), **r,
-        ))
-
-ev_df = pd.DataFrame(all_rows)
-
-print(f"\nTotal events — relative: {(ev_df.track=='relative').sum()}, "
-      f"absolute: {(ev_df.track=='absolute').sum()}")
-print("\nRelative thresholds (CF_sys, NDJFM "
-      f"{THRESHOLD_PCT}th pct): " +
-      ", ".join(f"{c}: {v:.3f}" for c, v in thresholds.items()))
-print("\nPer-country means (relative track):")
-print(ev_df[ev_df.track == 'relative']
-      .groupby('country')[['duration', 'severity_S', 'deficit_cf_days']]
-      .mean().round(2).to_string())
-
 
 #%%
 # ─── Annual aggregates (zero-filled over complete winters, per track) ─────────
@@ -614,10 +658,12 @@ print(ev_df[ev_df.track == 'relative']
 # percentile, so GWh is left as a relative diagnostic only.
 
 def aggregate_annual(df_track):
+    # determine how to aggregate n_severe
+    severe_agg = ('is severe', 'sum') if 'is_severe' in df_track.columns else ('duration', 'size')
+ 
     a = (df_track.groupby(['country', 'winter'])
          .agg(n_events   =('duration',        'size'),
-              n_severe   =('is_severe',        'sum') if 'is_severe' in df_track
-                          else ('duration', 'size'),
+              n_severe   = severe_agg,
               total_dur  =('duration',        'sum'),
               mean_dur   =('duration',        'mean'),
               max_dur    =('duration',        'max'),
@@ -720,11 +766,7 @@ plt.tight_layout()
 # fig.savefig(OUT_DIR / 'df_supply_monthly_diag.svg', bbox_inches='tight')
 plt.show()
 
-# %%
-# in the annual aggregation or post-hoc:
-annual['deficit_GWh'] = annual.apply(
-    lambda r: r['total_cf'] * IC_CAPACITY_TOTAL.get(r['country'], np.nan) * 24 / 1000,
-    axis=1)
+
 # %%
 #%%
 
@@ -810,10 +852,10 @@ ax.add_feature(cfeature.OCEAN.with_scale('10m'), facecolor='#C6E2F5', zorder=0)
 ax.add_feature(cfeature.LAND.with_scale('10m'),  facecolor='#f0f0f0', zorder=0)
 
 # Onshore — solid fill
-im = ax.pcolormesh(lon, lat, onshore_freq, transform=ccrs.PlateCarree(),
+im = ax.pcolormesh(lon, lat, onshore_val, transform=ccrs.PlateCarree(),
                    cmap='YlOrRd', vmin=vmin, vmax=vmax, shading='nearest', zorder=1)
 # Offshore — same color scale, hatched to mark the sea zone
-ax.pcolormesh(lon, lat, offshore_freq, transform=ccrs.PlateCarree(),
+ax.pcolormesh(lon, lat, offshore_val, transform=ccrs.PlateCarree(),
               cmap='YlOrRd', vmin=vmin, vmax=vmax, shading='nearest',
               alpha=0.85, zorder=1, hatch='///')
 
@@ -844,4 +886,278 @@ ax.set_title(
 plt.tight_layout()
 # fig.savefig(OUT_DIR / 'df_supply_country_freq_map.svg', bbox_inches='tight')
 plt.show()
+# %%
+#%%
+# ─── Load maximum installable capacity potentials ─────────────────────────────
+# Source: Advances in Applied Energy (2023), doi:10.1016/j.adapen.2023.100134
+# Land-eligibility x maximum installable density, per 0.25 deg cell, in MW.
+#
+# The file's own CF_* columns are static per-cell annual means from the source
+# study's siting analysis -- they are DROPPED. All temporal variability comes
+# from our ERA5-derived daily CFs; only the potential_* (MW) columns are used.
+#
+# Grid check: potentials are on an exact 0.25 deg grid, pixel-aligned with ERA5,
+# so a reindex onto the CF grid is sufficient -- no interpolation/regridding.
+
+POT_PATH = Path('./../Data/CF_info_grid.csv')
+
+pot_df = pd.read_csv(POT_PATH)[
+    ['lon', 'lat', 'potential_onshore', 'potential_offshore', 'potential_PV']
+]
+
+def potentials_to_grid(df, template):
+    """Pivot the long-format potential table onto the ERA5 CF grid (MW per cell)."""
+    ds = (df.set_index(['lat', 'lon'])
+            .to_xarray()
+            .rename({'lat': 'latitude', 'lon': 'longitude'}))
+    # Align to the CF grid; cells absent from the source file have no potential
+    ds = ds.reindex(latitude=template.latitude,
+                    longitude=template.longitude,
+                    fill_value=0.0)
+    return ds.rename({'potential_onshore':  'pot_on',
+                      'potential_offshore': 'pot_off',
+                      'potential_PV':       'pot_pv'})
+
+pot = potentials_to_grid(pot_df, CF_sys.isel(time=0))
+
+print("Installable potential on CF grid [GW]:")
+for v, lbl in [('pot_on', 'onshore'), ('pot_off', 'offshore'), ('pot_pv', 'solar PV')]:
+    print(f"  {lbl:9s}: {float(pot[v].sum()) / 1e3:8.1f} GW  "
+          f"({int((pot[v] > 0).sum()):5d} cells)")
+
+
+#%%
+# ─── Track B1 (headline): potential-weighted country CF_sys ───────────────────
+# Per cell, the three sources are weighted by their installable capacity, then
+# summed over the country and normalised by that country's total potential:
+#
+#   CF_sys_country(t) = sum_cells [ CF_wind(t)*pot_on + CF_wind(t)*pot_off
+#                                 + CF_solar(t)*pot_pv ]
+#                       / sum_cells [ pot_on + pot_off + pot_pv ]
+#
+# This is dimensionless (a fleet-average capacity factor) and carries the real
+# WITHIN-country spatial mix -- no national-average mix constant, no build-out
+# magnitude claim. Offshore uses the same wind CF field as onshore (single
+# turbine assumption; understates offshore CF -- stated caveat).
+#
+# Country assignment reuses the buffered masks: a cell counts toward a country
+# if it falls in that country's onshore OR offshore mask. Which SOURCE a cell
+# contributes is decided by the data (pot_on / pot_off / pot_pv), not by the
+# land/sea split -- an improvement over the buffer approximation.
+
+masks_any = {c: (masks_on[c] | masks_off[c]) for c in COUNTRIES.values()}
+
+cf_country_pot = {}
+mix_pot        = {}      # per-country potential shares, for reporting
+tot_pot        = {}      # per-country total installable MW (supplementary)
+
+for code in COUNTRIES.values():
+    m = masks_any[code]
+    p_on  = float(pot['pot_on'].where(m).sum())
+    p_off = float(pot['pot_off'].where(m).sum())
+    p_pv  = float(pot['pot_pv'].where(m).sum())
+    p_tot = p_on + p_off + p_pv
+
+    # Capacity-weighted generation summed over the country, then normalised
+    gen = ((CF_wind_dly  * pot['pot_on'].where(m, 0.0)).sum(['latitude', 'longitude'])
+         + (CF_wind_dly  * pot['pot_off'].where(m, 0.0)).sum(['latitude', 'longitude'])
+         + (CF_solar_dly * pot['pot_pv'].where(m, 0.0)).sum(['latitude', 'longitude']))
+
+    cf_country_pot[code] = (gen / p_tot).values
+    mix_pot[code] = dict(won=p_on / p_tot, woff=p_off / p_tot, wsol=p_pv / p_tot)
+    tot_pot[code] = p_tot
+
+cf_country_pot = pd.DataFrame(cf_country_pot, index=times)
+mix_pot        = pd.DataFrame(mix_pot).T
+tot_pot        = pd.Series(tot_pot, name='total_potential_MW')
+
+print("\nPotential-based mix shares (onshore / offshore / solar):")
+print(mix_pot.round(3).to_string())
+print("\nTotal installable potential per country [GW]:")
+print((tot_pot / 1e3).round(1).to_string())
+print("\nMean NDJFM CF_sys (potential-weighted):")
+print(cf_country_pot[winter_ok].mean().round(3).to_string())
+
+
+#%%
+# ─── Track B2 (comparison): IRENA-2024 current-mix country CF_sys ─────────────
+# Spatially aggregate CFs first, then combine with the country-level IRENA mix.
+# Coarser by construction (one national mix, no within-country texture) -- kept
+# as the present-day comparison against the potential-weighted headline.
+
+cf_country_irena = {}
+for code in COUNTRIES.values():
+    cf_on  = CF_wind_dly.where(masks_on[code]).mean(['latitude', 'longitude'])
+    cf_off = CF_wind_dly.where(masks_off[code]).mean(['latitude', 'longitude'])
+    cf_sol = CF_solar_dly.where(masks_on[code]).mean(['latitude', 'longitude'])
+
+    won, woff, wsol = W.loc[code, ['won', 'woff', 'wsol']]
+    cf_country_irena[code] = (won  * cf_on
+                            + woff * cf_off.fillna(0.0)
+                            + wsol * cf_sol).values
+
+cf_country_irena = pd.DataFrame(cf_country_irena, index=times)
+
+print("Mean NDJFM CF_sys (IRENA 2024 mix):")
+print(cf_country_irena[winter_ok].mean().round(3).to_string())
+
+# Mix comparison: how different are the two portfolios?
+mix_cmp = pd.concat([mix_pot.add_suffix('_pot'), W.add_suffix('_irena')], axis=1)
+print("\nMix comparison (potential vs IRENA 2024):")
+print(mix_cmp[['won_pot', 'won_irena', 'woff_pot', 'woff_irena',
+               'wsol_pot', 'wsol_irena']].round(3).to_string())
+
+
+#%%
+# ─── Run detection on both mixes ──────────────────────────────────────────────
+# Same grammar for both, so the only difference is the portfolio weighting.
+
+def run_country_detection(cf_df, mix_label):
+    """Relative + absolute detection for every country in cf_df."""
+    rows, thr_d, evt_d, abs_evt_d = [], {}, {}, {}
+
+    for code in cf_df.columns:
+        x = cf_df[code].values
+
+        # Relative (within-NDJFM percentile)
+        evt, thr, thr_sev, sigma = detect_events_1d(
+            x, winter_ok, thr_pct=THRESHOLD_PCT, severe_pct=SEVERE_PCT,
+            max_gap=MAX_GAP, min_duration=MIN_DURATION)
+        thr_d[code], evt_d[code] = thr, evt
+
+        for r in characterize_events_1d(evt, x, thr, thr_sev, sigma):
+            s_idx, e_idx = r.pop('start_idx'), r.pop('end_idx')
+            rows.append(dict(country=code, mix=mix_label, track='relative',
+                             start_date=times[s_idx], end_date=times[e_idx],
+                             winter=int(winter_id[s_idx]), thr_cf=float(thr), **r))
+
+        # Absolute (fixed CF floor)
+        a_evt, a_thr, _, a_sigma = detect_events_1d(
+            x, winter_ok, max_gap=MAX_GAP, min_duration=MIN_DURATION,
+            absolute_threshold=ABS_CF_THRESHOLD)
+        abs_evt_d[code] = a_evt
+
+        for r in characterize_events_1d(a_evt, x, a_thr, a_thr, a_sigma):
+            r.pop('is_severe')
+            s_idx, e_idx = r.pop('start_idx'), r.pop('end_idx')
+            rows.append(dict(country=code, mix=mix_label, track='absolute',
+                             start_date=times[s_idx], end_date=times[e_idx],
+                             winter=int(winter_id[s_idx]),
+                             thr_cf=float(ABS_CF_THRESHOLD), **r))
+
+    return pd.DataFrame(rows), thr_d, evt_d, abs_evt_d
+
+
+ev_pot,   thr_pot,   evt_pot,   abs_evt_pot   = run_country_detection(cf_country_pot,   'potential')
+ev_irena, thr_irena, evt_irena, abs_evt_irena = run_country_detection(cf_country_irena, 'irena2024')
+
+ev_df = pd.concat([ev_pot, ev_irena], ignore_index=True)
+
+print("Events detected:")
+print(ev_df.groupby(['mix', 'track']).size().to_string())
+print("\nRelative thresholds (potential mix):")
+print(", ".join(f"{c}: {v:.3f}" for c, v in thr_pot.items()))
+print("Relative thresholds (IRENA mix):")
+print(", ".join(f"{c}: {v:.3f}" for c, v in thr_irena.items()))
+
+
+#%%
+# ─── Event-set agreement between the two mixes ────────────────────────────────
+# How much does the portfolio weighting change WHICH days are flagged?
+# High overlap -> detection is robust to the mix assumption (a useful result).
+
+print("Relative-track event-day overlap (potential vs IRENA):")
+for code in COUNTRIES.values():
+    a, b = evt_pot[code], evt_irena[code]
+    inter, union = (a & b).sum(), (a | b).sum()
+    print(f"  {code}: Jaccard = {inter / union:.2f}   "
+          f"({int(inter)} shared of {int(union)} union event days)")
+
+
+#%%
+# ─── Map: installable potential and its spatial mix ───────────────────────────
+# Headline spatial figure: where the renewable resource can physically go.
+# Panels 1-3: absolute MW per cell (supplementary framing).
+# Panel 4: solar share of total potential -- the spatial mix that drives the
+#          headline detection.
+
+pot_total  = pot['pot_on'] + pot['pot_off'] + pot['pot_pv']
+solar_frac = (pot['pot_pv'] / pot_total).where(pot_total > 0)
+
+panels = [
+    (pot['pot_on'],  'Onshore wind potential',  'MW / cell',        'Greens'),
+    (pot['pot_off'], 'Offshore wind potential', 'MW / cell',        'Blues'),
+    (pot['pot_pv'],  'Solar PV potential',      'MW / cell',        'Oranges'),
+    (solar_frac,     'Solar share of potential', 'fraction',        'RdYlBu_r'),
+]
+
+fig, axes = plt.subplots(2, 2, figsize=(15, 13),
+                         subplot_kw={'projection': proj})
+
+for ax, (da, ttl, cbar_lbl, cmap) in zip(axes.ravel(), panels):
+    ax.set_extent([-14, 18, 42, 62], crs=ccrs.PlateCarree())
+    ax.add_feature(cfeature.OCEAN.with_scale('10m'), facecolor='#C6E2F5', zorder=0)
+    ax.add_feature(cfeature.LAND.with_scale('10m'),  facecolor='#f0f0f0', zorder=0)
+    im = ax.pcolormesh(da.longitude, da.latitude, da.where(da > 0),
+                       transform=ccrs.PlateCarree(), cmap=cmap,
+                       shading='nearest', zorder=1)
+    ax.add_feature(cfeature.COASTLINE.with_scale('10m'), linewidth=0.8, zorder=3)
+    ax.add_feature(cfeature.BORDERS.with_scale('10m'), linewidth=0.5,
+                   linestyle=':', zorder=3)
+    cbar = fig.colorbar(im, ax=ax, shrink=0.7, pad=0.03)
+    cbar.set_label(cbar_lbl, fontsize=10)
+    ax.set_title(ttl, fontsize=11, fontweight='bold')
+
+fig.suptitle('Maximum installable renewable capacity (Adv. Appl. Energy 2023)',
+             fontsize=12, fontweight='bold')
+plt.tight_layout()
+fig.savefig(OUT_DIR / 'df_supply_potential_maps.svg', bbox_inches='tight')
+plt.show()
+
+
+#%%
+# ─── Save supply-side outputs for the residual-load stage ─────────────────────
+# cf_country_*.parquet feed 06_DF_RL.py: multiply by capacity (IRENA MW for the
+# present-day RL arm) and difference against demand_weather.parquet.
+
+annual_all = []
+for mix_label, df_mix in ev_df.groupby('mix'):
+    for track, df_t in df_mix.groupby('track'):
+        a = (df_t.groupby(['country', 'winter'])
+             .agg(n_events =('duration',        'size'),
+                  total_dur=('duration',        'sum'),
+                  mean_dur =('duration',        'mean'),
+                  max_dur  =('duration',        'max'),
+                  total_S  =('severity_S',      'sum'),
+                  total_cf =('deficit_cf_days', 'sum'))
+             .reset_index())
+        full = pd.MultiIndex.from_product(
+            [list(COUNTRIES.values()), valid_winters], names=['country', 'winter'])
+        a = a.set_index(['country', 'winter']).reindex(full, fill_value=0).reset_index()
+        a.loc[a['n_events'] == 0, ['mean_dur', 'max_dur']] = np.nan
+        a['mix'], a['track'] = mix_label, track
+        annual_all.append(a)
+
+annual = pd.concat(annual_all, ignore_index=True)
+
+cf_country_pot.to_parquet(OUT_DIR   / 'cf_country_potential.parquet')
+cf_country_irena.to_parquet(OUT_DIR / 'cf_country_irena.parquet')
+mix_pot.to_csv(OUT_DIR / 'mix_shares_potential.csv')
+tot_pot.to_csv(OUT_DIR / 'total_potential_MW.csv')
+ev_df.to_parquet(OUT_DIR  / 'df_supply_events.parquet')
+annual.to_parquet(OUT_DIR / 'df_supply_annual.parquet')
+
+run_cfg = dict(potential_source='doi:10.1016/j.adapen.2023.100134',
+               cap_vintage=CAP_VINTAGE, threshold_pct=THRESHOLD_PCT,
+               severe_pct=SEVERE_PCT, abs_cf=ABS_CF_THRESHOLD,
+               max_gap=MAX_GAP, min_duration=MIN_DURATION,
+               winter_months=WINTER_MONTHS, buffer_deg=BUFFER_DEG,
+               n_winters=n_winters)
+pd.Series(run_cfg).to_json(OUT_DIR / 'df_supply_runconfig.json')
+
+print(f"Saved → {OUT_DIR / 'cf_country_potential.parquet'}  (headline)")
+print(f"Saved → {OUT_DIR / 'cf_country_irena.parquet'}     (comparison)")
+print(f"Saved → {OUT_DIR / 'df_supply_events.parquet'}")
+print(f"Saved → {OUT_DIR / 'df_supply_annual.parquet'}")
+
 # %%
