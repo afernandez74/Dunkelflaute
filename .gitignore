@@ -20,6 +20,7 @@ venv/
 Data/
 Results/
 Figures/
+Figs/
 logs/
 
 # OS-specific
