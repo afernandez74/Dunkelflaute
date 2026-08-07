@@ -46,7 +46,6 @@ import pandas as pd
 import xarray as xr
 import statsmodels.api as sm
 import geopandas as gpd
-import regionmask
 import shapely
 
 import matplotlib.pyplot as plt
