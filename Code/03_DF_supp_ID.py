@@ -360,7 +360,9 @@ capgen_pot_df   = pd.DataFrame(gen_pot_abs,    index=times)
 print("Time series generated for all three tracks.")
 
 # %%
-# Event Detection and characterization functions
+# =================================
+# Event Detection and characterization functions 
+# =================================
 
 def merge_and_filter_runs_1d(flag, max_gap, min_duration):
     """
