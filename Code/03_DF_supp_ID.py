@@ -40,6 +40,7 @@ import cartopy.feature as cfeature
 # Config and params
 WINTER_MONTHS = [11, 12, 1, 2, 3]   # extended winter (NDJFM)
 THRESHOLD_PCT = 10                  # lower-tail within-season percentilen threshold (%)
+GRID_CF_THRESHOLD = 0.05            # grid-cell CF threshold (%)
 SEVERE_PCT    = 5                   # severe tier percentile threshold (%)
 MAX_GAP       = 1                   # Otero'22: events separated by < 2 days are pooled
 MIN_DURATION  = 3                   # Min event duration filter (days)
@@ -71,7 +72,6 @@ EEZ_SHP = Path('./../Data/EEZ/World_EEZ_v12_20231025/eez_v12.shp')
 
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 #%%
-# ====================================================
 # Load installed capacity data (IRENA and Hu)
 # ====================================================
 #
@@ -360,7 +360,7 @@ capgen_pot_df   = pd.DataFrame(gen_pot_abs,    index=times)
 print("Time series generated for all three tracks.")
 
 # %%
-# =================================
+# 
 # Event Detection and characterization functions 
 # =================================
 
@@ -510,7 +510,6 @@ events_pot_abs = run_detection(
 master_events_df = pd.concat([events_irena_rel, events_pot_rel, events_pot_abs], ignore_index=True)
 
 print(f"\nDetection complete. Master catalog contains {len(master_events_df)} events.")
-# %%
 #%%
 # Annual Aggregations (Zero-filled climatology)
 
@@ -548,8 +547,295 @@ annual_df = pd.concat(annual_records, ignore_index=True)
 
 print("\nAnnual aggregations complete.")
 print(annual_df.groupby('track')[['n_events', 'total_S']].sum().to_string())
-# %%
+
+
+#%% 
+# PLOTS FOR COUNTRY LEVEL ANALYSIS
+
+# Visualization Option 1: Zoomed Spatiotemporal Event Ribbon Plot (Concurrence)
+# ==============================================================================
+import matplotlib.dates as mdates
+
+# Restrict to a tight 2-winter window for readability
+t_start_ribbon = pd.Timestamp('2018-10-01')
+t_end_ribbon   = pd.Timestamp('2020-04-01')
+
+winter_mask_window = winter_ok & (times >= t_start_ribbon) & (times <= t_end_ribbon)
+window_dates = times[winter_mask_window]
+countries_list = list(COUNTRIES.values())
+
+ribbon_matrix = pd.DataFrame(0.0, index=countries_list, columns=window_dates)
+ev_relative = master_events_df[master_events_df['track'] == 'IRENA_Relative_10pct']
+
+for _, row in ev_relative.iterrows():
+    c = row['country']
+    s_date = row['start_date']
+    e_date = row['end_date']
+    sev = row['severity_S']
+    
+    mask_dates = (window_dates >= s_date) & (window_dates <= e_date)
+    matching_days = window_dates[mask_dates]
+    if len(matching_days) > 0:
+        ribbon_matrix.loc[c, matching_days] = sev
+
+fig, ax = plt.subplots(figsize=(14, 4.5))
+im = ax.imshow(ribbon_matrix.values, aspect='auto', cmap='YlOrRd', interpolation='nearest',
+               extent=[mdates.date2num(window_dates[0]), mdates.date2num(window_dates[-1]), len(countries_list) - 0.5, -0.5])
+
+ax.set_yticks(range(len(countries_list)))
+ax.set_yticklabels(countries_list, fontweight='bold')
+ax.xaxis.set_major_locator(mdates.MonthLocator(bymonth=[1, 4, 7, 10]))
+ax.xaxis.set_major_formatter(mdates.DateFormatter('%b %Y'))
+
+cbar = fig.colorbar(im, ax=ax, pad=0.02, shrink=0.8)
+cbar.set_label('Event Severity (S)', fontsize=10)
+
+ax.set_title(f"Supply-Side Dunkelflaute Concurrence Ribbon ({t_start_ribbon.date()} to {t_end_ribbon.date()})", fontsize=12, fontweight='bold', pad=12)
+ax.set_xlabel("Date", fontsize=11)
+plt.tight_layout()
+plt.show()
+
 #%%
+# ==============================================================================
+# Visualization Option 3: Jaccard Overlap Matrix (Country Interdependence)
+# ==============================================================================
+all_winter_dates = times[winter_ok]
+event_bool_df = pd.DataFrame(False, index=all_winter_dates, columns=countries_list)
+for _, row in ev_relative.iterrows():
+    mask = (all_winter_dates >= row['start_date']) & (all_winter_dates <= row['end_date'])
+    event_bool_df.loc[mask, row['country']] = True
+
+jaccard_matrix = pd.DataFrame(1.0, index=countries_list, columns=countries_list)
+for c1 in countries_list:
+    for c2 in countries_list:
+        a = event_bool_df[c1]
+        b = event_bool_df[c2]
+        inter = (a & b).sum()
+        union = (a | b).sum()
+        jaccard_matrix.loc[c1, c2] = (inter / union) if union > 0 else 0.0
+
+fig, ax = plt.subplots(figsize=(8, 6))
+cax = ax.matshow(jaccard_matrix, cmap='Blues', vmin=0, vmax=1)
+
+for i in range(len(countries_list)):
+    for j in range(len(countries_list)):
+        val = jaccard_matrix.iloc[i, j]
+        ax.text(j, i, f"{val:.2f}", ha='center', va='center', color='black' if val < 0.6 else 'white', fontsize=10)
+
+ax.set_xticks(range(len(countries_list)))
+ax.set_yticks(range(len(countries_list)))
+ax.set_xticklabels(countries_list)
+ax.set_yticklabels(countries_list)
+ax.xaxis.set_ticks_position('bottom')
+ax.set_title("Event-Day Jaccard Overlap Matrix (IRENA Relative Track)", fontsize=13, fontweight='bold', pad=15)
+
+fig.colorbar(cax, ax=ax, shrink=0.8, label='Jaccard Index')
+plt.tight_layout()
+plt.show()
+
+#%%
+# ==============================================================================
+# Visualization Option 4: Multi-Country Concurrence Distribution (Active Tail Only)
+# ==============================================================================
+concurrence_counts = event_bool_df.sum(axis=1)
+# Drop zero-day counts to focus strictly on active crisis days
+concurrence_active = concurrence_counts[concurrence_counts > 0].value_counts().sort_index()
+
+fig, ax = plt.subplots(figsize=(8, 5))
+concurrence_active.plot(kind='bar', ax=ax, color='darkorange', edgecolor='k', width=0.6)
+
+ax.set_title("Distribution of Multi-Country Concurrence (Active Crisis Days Only)", fontsize=13, fontweight='bold', pad=12)
+ax.set_xlabel("Number of Countries Simultaneously in Dunkelflaute", fontsize=11)
+ax.set_ylabel("Number of Days", fontsize=11)
+ax.grid(axis='y', alpha=0.3, linestyle='--')
+ax.set_xticklabels(ax.get_xticklabels(), rotation=0)
+
+plt.tight_layout()
+plt.show()
+
+#%%
+# ==============================================================================
+# Visualization Option 5: Portfolio Sensitivity (Relative Tracks Only)
+# ==============================================================================
+rel_tracks_list = ['IRENA_Relative_10pct', 'MaxPot_Relative_10pct']
+relative_annual_df = annual_df[annual_df['track'].isin(rel_tracks_list)]
+comp_df = relative_annual_df.groupby(['country', 'track'])['total_S'].sum().unstack()
+
+fig, ax = plt.subplots(figsize=(10, 6))
+comp_df.plot(kind='bar', ax=ax, width=0.7, colormap='Set2', edgecolor='k', linewidth=0.5)
+
+ax.set_title("Portfolio Sensitivity: Cumulative Winter Severity (IRENA vs. Max Potential Relative Tracks)", fontsize=13, fontweight='bold', pad=12)
+ax.set_ylabel("Cumulative Severity (Sum of S)", fontsize=11)
+ax.set_xlabel("Country", fontsize=11)
+ax.grid(axis='y', alpha=0.3, linestyle='--')
+ax.legend(title="Methodology Track", loc='upper left', frameon=True)
+
+plt.tight_layout()
+plt.show()
+#%%
+# Detect gridcell-level spatial vulnerability (Compound Intersection)
+# PART 1: Gridcell-Level Spatial Vulnerability (Compound Intersection)
+# ==============================================================================
+print("Starting gridcell-level compound spatial hazard analysis...")
+
+GRID_CF_THRESHOLD = 0.10  # 10% fixed efficiency threshold
+
+# 1. Define complete study domain
+study_domain = xr.full_like(masks_on['FR'], False, dtype=bool)
+for code in COUNTRIES.values():
+    study_domain = study_domain | masks_on[code] | masks_off[code]
+
+# 2. Calculate local gridcell technology weights based on Max Potential
+p_tot = pot_grid['pot_on'] + pot_grid['pot_off'] + pot_grid['pot_pv']
+p_tot_safe = p_tot.where(p_tot > 0, 1.0)
+
+w_on  = pot_grid['pot_on'] / p_tot_safe
+w_off = pot_grid['pot_off'] / p_tot_safe
+w_sol = pot_grid['pot_pv'] / p_tot_safe
+
+# 3. Compute blended capacity factor array
+cf_blend = (w_on * CF_wind_dly) + (w_off * CF_wind_dly) + (w_sol * CF_solar_dly)
+
+# 4. Transpose dimensions to NumPy arrays (time, latitude, longitude)
+lats = CF_wind_dly.latitude.values
+lons = CF_wind_dly.longitude.values
+
+cf_wind_np  = CF_wind_dly.transpose('time', 'latitude', 'longitude').values
+cf_solar_np = CF_solar_dly.transpose('time', 'latitude', 'longitude').values
+cf_blend_np = cf_blend.transpose('time', 'latitude', 'longitude').values
+
+domain_mask = (study_domain.values) & (p_tot.values > 0)
+valid_i, valid_j = np.where(domain_mask)
+
+# 5. Initialize result grids
+freq_wind     = np.full((len(lats), len(lons)), np.nan)
+freq_solar    = np.full((len(lats), len(lons)), np.nan)
+freq_blend    = np.full((len(lats), len(lons)), np.nan)
+freq_compound = np.full((len(lats), len(lons)), np.nan)
+
+dur_compound  = np.full((len(lats), len(lons)), np.nan)
+sev_compound  = np.full((len(lats), len(lons)), np.nan)
+
+# 6. Spatial Loop
+for i, j in zip(valid_i, valid_j):
+    ts_w = cf_wind_np[:, i, j]
+    ts_s = cf_solar_np[:, i, j]
+    ts_b = cf_blend_np[:, i, j]
+    
+    # --- Track 1: Wind-Only Drought (CF_wind < 0.10) ---
+    mask_w, _, _ = detect_events_1d(ts_w, winter_ok, abs_thr=GRID_CF_THRESHOLD, max_gap=MAX_GAP, min_duration=MIN_DURATION)
+    if mask_w is not None and np.any(mask_w):
+        rows_w = characterize_events_1d(mask_w, ts_w, GRID_CF_THRESHOLD, np.nanstd(ts_w[winter_ok]))
+        freq_wind[i, j] = len(rows_w) / n_winters
+    else:
+        freq_wind[i, j] = 0
+
+    # --- Track 2: Solar-Only Drought (CF_solar < 0.10) ---
+    mask_s, _, _ = detect_events_1d(ts_s, winter_ok, abs_thr=GRID_CF_THRESHOLD, max_gap=MAX_GAP, min_duration=MIN_DURATION)
+    if mask_s is not None and np.any(mask_s):
+        rows_s = characterize_events_1d(mask_s, ts_s, GRID_CF_THRESHOLD, np.nanstd(ts_s[winter_ok]))
+        freq_solar[i, j] = len(rows_s) / n_winters
+    else:
+        freq_solar[i, j] = 0
+
+    # --- Track 3: Blended CF Drought (CF_blend < 0.10) ---
+    mask_b, _, _ = detect_events_1d(ts_b, winter_ok, abs_thr=GRID_CF_THRESHOLD, max_gap=MAX_GAP, min_duration=MIN_DURATION)
+    if mask_b is not None and np.any(mask_b):
+        rows_b = characterize_events_1d(mask_b, ts_b, GRID_CF_THRESHOLD, np.nanstd(ts_b[winter_ok]))
+        freq_blend[i, j] = len(rows_b) / n_winters
+    else:
+        freq_blend[i, j] = 0
+
+    # --- Track 4: Compound Dunkelflaute (Wind < 0.10 AND Solar < 0.10) ---
+    raw_compound_flag = (ts_w < GRID_CF_THRESHOLD) & (ts_s < GRID_CF_THRESHOLD) & winter_ok
+    mask_c = merge_and_filter_runs_1d(raw_compound_flag, max_gap=MAX_GAP, min_duration=MIN_DURATION)
+    
+    if np.any(mask_c):
+        # Evaluate deficit severity against the Blended CF time series
+        sigma_b = np.nanstd(ts_b[winter_ok])
+        rows_c = characterize_events_1d(mask_c, ts_b, GRID_CF_THRESHOLD, sigma_b)
+        
+        freq_compound[i, j] = len(rows_c) / n_winters
+        dur_compound[i, j]  = np.mean([r['duration'] for r in rows_c])
+        sev_compound[i, j]  = np.mean([r['severity_S'] for r in rows_c])
+    else:
+        freq_compound[i, j] = 0
+        dur_compound[i, j]  = 0
+        sev_compound[i, j]  = 0
+
+# 7. Package into xarray Dataset
+ds_compound = xr.Dataset(
+    {
+        'freq_wind':     (['latitude', 'longitude'], freq_wind),
+        'freq_solar':    (['latitude', 'longitude'], freq_solar),
+        'freq_blend':    (['latitude', 'longitude'], freq_blend),
+        'freq_compound': (['latitude', 'longitude'], freq_compound),
+        'dur_compound':  (['latitude', 'longitude'], dur_compound),
+        'sev_compound':  (['latitude', 'longitude'], sev_compound),
+    },
+    coords={'latitude': lats, 'longitude': lons}
+)
+print("Compound spatial climatology complete.")
+#%%
+# ==============================================================================
+# Plot: 4-Panel Comparative Narrative (Wind vs Solar vs Blend vs Compound)
+# ==============================================================================
+
+fig, axes = plt.subplots(1, 4, figsize=(25, 7), subplot_kw={'projection': ccrs.PlateCarree()})
+
+def format_map(ax, title):
+    ax.add_feature(cfeature.OCEAN, facecolor='aliceblue')
+    ax.add_feature(cfeature.LAND, facecolor='whitesmoke')
+    ax.add_feature(cfeature.BORDERS, linewidth=0.5, edgecolor='gray')
+    ax.add_feature(cfeature.COASTLINE, linewidth=0.8, edgecolor='black')
+    ax.set_extent([lons.min(), lons.max(), lats.min(), lats.max()], crs=ccrs.PlateCarree())
+    ax.set_title(title, fontsize=13, pad=10, fontweight='bold')
+    gl = ax.gridlines(draw_labels=True, linewidth=0.5, color='gray', alpha=0.3, linestyle='--')
+    gl.top_labels = False
+    gl.right_labels = False
+
+# Common colorbar limits for direct comparability
+vmax_freq = max(
+    np.nanmax(ds_compound['freq_wind']), 
+    np.nanmax(ds_compound['freq_blend']), 
+    np.nanmax(ds_compound['freq_compound'])
+)
+
+# Panel 1: Wind-Only Drought Frequency
+format_map(axes[0], "1. Wind-Only Droughts\n(Wind CF < 10%)")
+im1 = axes[0].pcolormesh(lons, lats, ds_compound['freq_wind'], cmap='inferno_r', 
+                         vmin=0, vmax=vmax_freq, transform=ccrs.PlateCarree(), shading='auto')
+cbar1 = plt.colorbar(im1, ax=axes[0], orientation='horizontal', pad=0.08, fraction=0.046)
+cbar1.set_label('Events / Winter')
+
+# Panel 2: Solar-Only Drought Frequency
+format_map(axes[1], "2. Solar-Only Droughts\n(Solar CF < 10%)")
+im2 = axes[1].pcolormesh(lons, lats, ds_compound['freq_solar'], cmap='inferno_r', 
+                         transform=ccrs.PlateCarree(), shading='auto')
+cbar2 = plt.colorbar(im2, ax=axes[1], orientation='horizontal', pad=0.08, fraction=0.046)
+cbar2.set_label('Events / Winter')
+
+# Panel 3: Blended CF Drought Frequency (Solar Penalty)
+format_map(axes[2], "3. Blended CF Droughts\n(Mix Weighted CF < 10%)")
+im3 = axes[2].pcolormesh(lons, lats, ds_compound['freq_blend'], cmap='inferno_r', 
+                         vmin=0, vmax=vmax_freq, transform=ccrs.PlateCarree(), shading='auto')
+cbar3 = plt.colorbar(im3, ax=axes[2], orientation='horizontal', pad=0.08, fraction=0.046)
+cbar3.set_label('Events / Winter')
+
+# Panel 4: Compound Intersection (True Dunkelflaute)
+format_map(axes[3], "4. Compound Dunkelflaute\n(Wind AND Solar < 10%)")
+im4 = axes[3].pcolormesh(lons, lats, ds_compound['freq_compound'], cmap='inferno_r', 
+                         vmin=0, vmax=vmax_freq, transform=ccrs.PlateCarree(), shading='auto')
+cbar4 = plt.colorbar(im4, ax=axes[3], orientation='horizontal', pad=0.08, fraction=0.046)
+cbar4.set_label('Events / Winter')
+
+fig.suptitle("Deconstructing Meteorological Supply Risks: From Single-Source Lulls to Compound Dunkelflauten", 
+             fontsize=17, y=1.05)
+plt.tight_layout()
+plt.show()
+
+# Save NetCDF results for manuscript preparation
+ds_compound.to_netcdf(OUT_DIR / 'gridcell_compound_dunkelflaute.nc')
 #%%
 # Diagnostic Visualizations (Relative Tracks Only)
 

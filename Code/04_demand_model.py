@@ -54,7 +54,8 @@ RESULTS       = Path("./../Results/")
 COUNTRIES_SHP = Path("~/CDHW_ag/Data/countries/ne_10m_admin_0_countries.shp").expanduser()
 LOAD_DIR      = DATA / "entsoe_load"
 
-ERA5_DAT = os.environ.get("ERA5_dat")
+# ERA5_DAT = os.environ.get("ERA5_dat")
+ERA5_DAT = Path("/Volumes/AlejoED/WELCOME/")
 
 #%%
 # ====================================================
