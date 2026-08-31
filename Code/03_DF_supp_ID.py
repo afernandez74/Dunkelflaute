@@ -34,6 +34,8 @@ from scipy.stats import kendalltau
 import matplotlib.pyplot as plt
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
+from cartopy.mpl.gridliner import LONGITUDE_FORMATTER, LATITUDE_FORMATTER
+
 
 
 #%%
@@ -65,6 +67,7 @@ COUNTRIES = {                       # Natural Earth ADMIN name -> code
 # Input / Output Directories
 CF_DAILY_DIR  = Path('./../Results/CF_daily') # ERA5-based CF data
 OUT_DIR       = Path('./../Results/DF_supply') 
+FIG_DIR       = Path('./../Figures')
 IC_PATH       = Path('./../Data/IRENA_IC/IC.csv') # IRENA
 POT_PATH      = Path('./../Data/Hu_IC/CF_info_grid.csv') #
 COUNTRIES_SHP = Path('~/CDHW_ag/Data/countries/ne_10m_admin_0_countries.shp').expanduser()
@@ -73,8 +76,7 @@ EEZ_SHP = Path('./../Data/EEZ/World_EEZ_v12_20231025/eez_v12.shp')
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 #%%
 # Load installed capacity data (IRENA and Hu)
-# ====================================================
-#
+
 # ====================================================
 # IRENA (national ratios)
 # ====================================================
@@ -110,7 +112,6 @@ ds_pot = ds_pot.rename({'lat': 'latitude',
         
 #%%
 # Load daily capacity factors and winter masks
-# ====================================================
 
 # wind daily 
 CF_wind_dly  = xr.open_zarr(CF_DAILY_DIR / 'CF_wind_daily.zarr',
@@ -144,11 +145,177 @@ n_winters = len(valid_winters)
 
 print(f"\nERA5 Grid domain loaded: {len(times)} days ({times[0].date()} to {times[-1].date()})")
 print(f"Complete winters found: {n_winters} ({valid_winters[0]} -> {valid_winters[-1]})")
-
 #%%
-# =================================================================
+# Plot maps of max. installable capacity
+
+countries_gdf = gpd.read_file(str(COUNTRIES_SHP))
+
+LAEA = ccrs.LambertAzimuthalEqualArea(
+    central_longitude=10.0,
+    central_latitude=52.0
+)
+PC = ccrs.PlateCarree()
+
+# 
+DOMAIN_EXTENT = [
+    float(pot_grid.longitude.values.min()) - 0.5,
+    float(pot_grid.longitude.values.max()) + 0.5,
+    float(pot_grid.latitude.values.min())  - 0.5,
+    float(pot_grid.latitude.values.max())  + 0.5,
+]
+
+def format_capacity_map(ax):
+    """Apply the common map style used throughout the project."""
+
+    # Background
+    ax.add_feature(
+        cfeature.OCEAN,
+        facecolor='#C6E2F5',
+        zorder=0
+    )
+    ax.add_feature(
+        cfeature.LAND,
+        facecolor='0.93',
+        zorder=0
+    )
+
+    # Country boundaries
+    ax.add_geometries(
+        countries_gdf.geometry,
+        crs=PC,
+        facecolor='none',
+        edgecolor='0.35',
+        linewidth=0.5,
+        zorder=3
+    )
+
+    # Major political/coastal boundaries
+    ax.add_feature(
+        cfeature.BORDERS,
+        lw=0.9,
+        edgecolor='0.15',
+        zorder=4
+    )
+    ax.add_feature(
+        cfeature.COASTLINE,
+        lw=0.9,
+        zorder=4
+    )
+
+    # Spatial extent
+    ax.set_extent(DOMAIN_EXTENT, crs=PC)
+
+    # Gridlines
+    gl = ax.gridlines(
+        crs=PC,
+        draw_labels=True,
+        lw=0.25,
+        color='0.6',
+        alpha=0.5,
+        ls='--'
+    )
+
+    gl.top_labels = False
+    gl.right_labels = False
+
+    gl.xformatter = LONGITUDE_FORMATTER
+    gl.yformatter = LATITUDE_FORMATTER
+
+    gl.xlabel_style = {'size': 7}
+    gl.ylabel_style = {'size': 7}
+
+lons = pot_grid.longitude.values
+lats = pot_grid.latitude.values
+
+lon2d, lat2d = np.meshgrid(lons, lats)
+
+capacity_fields = {
+    'pot_on': {
+        'title': 'Maximum installable onshore wind capacity',
+        'label': 'Maximum installable capacity (GW)',
+        'cmap': 'YlGn',
+    },
+    'pot_off': {
+        'title': 'Maximum installable offshore wind capacity',
+        'label': 'Maximum installable capacity (GW)',
+        'cmap': 'Blues',
+    },
+    'pot_pv': {
+        'title': 'Maximum installable solar PV capacity',
+        'label': 'Maximum installable capacity (GW)',
+        'cmap': 'YlOrBr',
+    },
+}
+
+# Convert MW -> GW
+capacity_arrays = {name: pot_grid[name].values / 1000.0 for name in capacity_fields}
+
+# Use a robust upper limit so a small number of very large cells do not
+# dominate the visual range.
+vmax_capacity = {
+    name: np.nanpercentile(arr[arr > 0], 99)
+    if np.any(arr > 0)
+    else 1.0
+    for name, arr in capacity_arrays.items()
+}
+
+fig, axes = plt.subplots(
+    1, 3,
+    figsize=(16, 5.8),
+    subplot_kw={'projection': LAEA}
+)
+
+for ax, (var, cfg) in zip(axes, capacity_fields.items()):
+
+    data = capacity_arrays[var]
+
+    format_capacity_map(ax)
+
+    # Filled contours following the previous map style
+    cf = ax.contourf(
+        lon2d,
+        lat2d,
+        data,
+        levels=12,
+        vmin=0,
+        vmax=vmax_capacity[var],
+        cmap=cfg['cmap'],
+        transform=PC,
+        extend='max',
+        zorder=2
+    )
+
+    # Colorbar
+    cbar = fig.colorbar(
+        cf,
+        ax=ax,
+        orientation='vertical',
+        pad=0.03,
+        shrink=0.82,
+        aspect=22
+    )
+
+    cbar.set_label(
+        cfg['label'],
+        fontsize=9
+    )
+
+    cbar.ax.tick_params(labelsize=8)
+
+    # Panel title
+    ax.set_title(
+        cfg['title'],
+        fontsize=10,
+        pad=8
+    )
+
+fig.suptitle('Maximum installable renewable energy capacity', fontsize=13, y=1.02)
+
+plt.tight_layout()
+plt.
+plt.show()
+#%%
 # Build Country Spatial Masks (Onshore + Coastal Offshore Buffer)
-# =================================================================
 
 def build_masks(template_da, land_shp_path, eez_shp_path):
     land_gdf = gpd.read_file(str(land_shp_path))

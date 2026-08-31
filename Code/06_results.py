@@ -116,6 +116,10 @@ CF_MEAN_FRACTION  = 0.50        # used when mode == 'fraction_of_mean'
 CF_THR_SWEEP      = [0.10, 0.15, 0.20]        # SI 3, absolute mode
 CF_FRAC_SWEEP     = [0.40, 0.50, 0.60]        # SI 3, fraction mode
 
+# --- Supply gridcell fields (paper FIG 5) ----------------------------------
+GRID_ABS_CF   = 0.05        # panel (e): absolute blended-CF floor (deep-lull geography)
+GRID_REL_FRAC = 0.50        # panel (f): fraction of each cell's own NDJFM mean blended CF
+
 # --- Residual load (FIG 2/3): capacity build-out scenarios -----------------
 # capgen_pot_absolute.parquet is generation under Hu et al. (2023) MAXIMUM
 # installable potential, which greatly exceeds any plausible fleet and therefore
@@ -145,6 +149,7 @@ LAND_COLOR  = '#F5F5F2'
 MAP_EXTENT  = [-11.5, 16.5, 41.5, 59.5]
 Z500_EXTENT = [-14.0, 18.0, 42.0, 62.0]
 PROJ        = ccrs.LambertConformal(central_longitude=3, central_latitude=50)
+LAEA        = ccrs.LambertAzimuthalEqualArea(central_longitude=10.0, central_latitude=52.0)  # FIG 5 maps (matches 03)
 
 COUNTRIES = {
     "France"        : "FR",
@@ -171,6 +176,7 @@ CF_DAILY_DIR  = RESULTS_DIR / "CF_daily"
 COUNTRIES_SHP = Path("~/CDHW_ag/Data/countries/ne_10m_admin_0_countries.shp").expanduser()
 EEZ_SHP       = DATA_DIR / "EEZ/World_EEZ_v12_20231025/eez_v12.shp"
 IC_PATH       = DATA_DIR / "IRENA_IC/IC.csv"
+POT_PATH      = DATA_DIR / "Hu_IC/CF_info_grid.csv"        # Hu (2023) max-installable potential
 
 # Cache for the grid-cell climatology computed in this script.  The filename
 # encodes the threshold mode so switching modes does not silently reuse a stale
@@ -178,6 +184,8 @@ IC_PATH       = DATA_DIR / "IRENA_IC/IC.csv"
 _CACHE_TAG = (f"abs{int(ABS_CF_THRESHOLD*100)}" if CF_THRESHOLD_MODE == 'absolute'
               else f"frac{int(CF_MEAN_FRACTION*100)}")
 CELL_CACHE = RESULTS_DIR / "DF_supply" / f"cell_stats_irena_{_CACHE_TAG}.nc"
+GRID_CACHE = (RESULTS_DIR / "DF_supply" /
+              f"fig5_grid_stats_abs{int(GRID_ABS_CF*100):02d}_rel{int(GRID_REL_FRAC*100):02d}.nc")
 
 CDHW_ROOT = Path("~/CDHW_ag/Results").expanduser()
 CDHW_RUN  = "sm20_vpd90_sev10_95_gap3_dur3_off0"
@@ -464,91 +472,171 @@ mean/thr approaches 1, prefer CF_THRESHOLD_MODE = 'fraction_of_mean'.""")
 
 # %%
 # =================================================================
-# Grid-cell supply-side climatology (computed here, cached)
+# Paper FIG 5 — supply-side baseline: inputs and grid-cell fields
 # =================================================================
-# 03_DF_supp_ID.py writes no per-cell statistics file.  Computing it here makes
-# the parameters explicit and consistent with the country panels: same absolute
-# CF floor, same NDJFM season, same pooling and duration filter.
+# The draft FIG 1 (grid-cell + country choropleths) is retired.  This section
+# builds the paper's Figure 5: a supply-side weather-risk baseline whose maps
+# mimic the "Maximum installable capacity" style in 03_DF_supp_ID.py — Lambert
+# Azimuthal Equal Area (10E, 52N), filled contours, labelled gridlines, one
+# vertical colorbar per panel.  Panels are shown individually (plt.show()) and
+# NOT saved, so the final layout can be assembled by hand.
+#
+# Threshold logic (per the handoff, and no percentiles):
+#   (e) absolute floor   — blended CF < GRID_ABS_CF                 (resource geography)
+#   (f) relative to norm  — blended CF < GRID_REL_FRAC x cell mean  (local reliability)
+# The relative panel uses a fraction of each cell's own NDJFM mean, which is an
+# absolute CF magnitude that varies by cell — NOT a percentile of the distribution.
 
-def compute_cell_climatology(lat_block=20):
-    """
-    Per-cell event frequency (events per winter) and mean severity under an
-    absolute system-CF floor.
+# --- Hu (2023) maximum-installable capacity on the ERA5 grid -----------------
+_pot_raw = pd.read_csv(POT_PATH)[['lon', 'lat',
+                                  'potential_onshore', 'potential_offshore', 'potential_PV']]
+_ds_pot = (_pot_raw.set_index(['lat', 'lon']).to_xarray()
+           .rename({'lat': 'latitude', 'lon': 'longitude',
+                    'potential_onshore': 'pot_on',
+                    'potential_offshore': 'pot_off',
+                    'potential_PV': 'pot_pv'}))
 
-    Processed in latitude bands so peak memory stays bounded: the full daily CF
-    field over the regional domain is ~700 MB in float32, which is loadable but
-    wasteful when the reduction is per-cell anyway.
-    """
-    wind = xr.open_zarr(CF_DAILY_DIR / 'CF_wind_daily.zarr',
-                        consolidated=True)['CF_wind_dly']
-    solar = xr.open_zarr(CF_DAILY_DIR / 'CF_solar_24h_daily.zarr',
-                         consolidated=True)['CF_solar_24h_dly']
+# --- Daily CF fields, with a winter mask on THEIR OWN calendar ---------------
+# Do not reuse winter_ok (RL/demand calendar): the CF stores are ERA5-native and
+# can differ in length.  Build the mask exactly as 03 does.
+CF_wind_dly  = xr.open_zarr(CF_DAILY_DIR / 'CF_wind_daily.zarr',
+                            consolidated=True)['CF_wind_dly']
+CF_solar_dly = xr.open_zarr(CF_DAILY_DIR / 'CF_solar_24h_daily.zarr',
+                            consolidated=True)['CF_solar_24h_dly']
 
-    # The CF stores and the RL series must share a calendar for winter_ok to apply.
-    n_t = wind.sizes['time']
-    if n_t != len(winter_ok):
-        raise ValueError(f"CF time axis ({n_t}) does not match the RL calendar "
-                         f"({len(winter_ok)}); align before computing cell stats.")
+pot_grid = _ds_pot.reindex(latitude=CF_wind_dly.latitude,
+                           longitude=CF_wind_dly.longitude, fill_value=0.0)
 
-    n_lat, n_lon = wind.sizes['latitude'], wind.sizes['longitude']
-    freq = np.full((n_lat, n_lon), np.nan, dtype=np.float32)
-    sev = np.full((n_lat, n_lon), np.nan, dtype=np.float32)
-    dur = np.full((n_lat, n_lon), np.nan, dtype=np.float32)
+_t_cf     = pd.DatetimeIndex(CF_wind_dly.time.values)
+_wid_cf   = np.where(_t_cf.month >= 11, _t_cf.year + 1, _t_cf.year)
+_ndjfm_cf = _t_cf.month.isin(WINTER_MONTHS)
+_vw_cf    = sorted(set(_wid_cf[_t_cf.month == 11]) & set(_wid_cf[_t_cf.month == 3]))
+winter_ok_cf = (_ndjfm_cf & np.isin(_wid_cf, _vw_cf))
+N_WINTERS_CF = len(_vw_cf)
+print(f"\nFIG 5 grid: {N_WINTERS_CF} winters, {int(winter_ok_cf.sum())} winter-days "
+      f"on the CF calendar")
+
+# --- Country cell masks (onshore land / offshore EEZ), ported from 03 --------
+def build_cell_masks(template_da, land_shp_path, eez_shp_path):
+    land_gdf = gpd.read_file(str(land_shp_path))
+    eez_gdf  = gpd.read_file(str(eez_shp_path))
+    lons, lats = np.meshgrid(template_da.longitude.values, template_da.latitude.values)
+    pts = shapely.points(lons.ravel(), lats.ravel())
+    all_land = land_gdf.union_all()
+    is_any_land = (shapely.distance(all_land, pts) == 0.0).reshape(lats.shape)
+
+    def _da(a):
+        return xr.DataArray(a, coords={'latitude': template_da.latitude,
+                                       'longitude': template_da.longitude},
+                            dims=['latitude', 'longitude'])
+    m_on, m_off = {}, {}
+    for name, code in COUNTRIES.items():
+        land_geom = land_gdf.loc[land_gdf['ADMIN'] == name].union_all()
+        if code == 'FR':
+            land_geom = land_geom.difference(shapely.geometry.box(8.5, 41.3, 9.6, 43.1))
+        m_on[code] = _da(shapely.within(pts, land_geom).reshape(lats.shape))
+
+        eez_geom = eez_gdf.loc[eez_gdf['SOVEREIGN1'] == name].union_all()
+        if code == 'GB':
+            eez_geom = eez_geom.difference(shapely.geometry.box(-15.0, 55.0, -10.0, 60.0))
+        if code == 'DK':
+            eez_geom = eez_geom.difference(shapely.geometry.box(-75.0, 58.0, -10.0, 85.0))
+            eez_geom = eez_geom.difference(shapely.geometry.box(-15.0, 59.0, 0.0, 65.0))
+        in_eez = shapely.within(pts, eez_geom).reshape(lats.shape)
+        m_off[code] = _da(in_eez & ~is_any_land)
+    return m_on, m_off
+
+masks_on, masks_off = build_cell_masks(CF_wind_dly.isel(time=0), COUNTRIES_SHP, EEZ_SHP)
+
+# Study-domain boolean: any study-country cell with non-zero buildable potential.
+study_cells = xr.full_like(masks_on['FR'], False, dtype=bool)
+for code in CODES:
+    study_cells = study_cells | masks_on[code] | masks_off[code]
+p_tot_grid  = pot_grid['pot_on'] + pot_grid['pot_off'] + pot_grid['pot_pv']
+study_cells = study_cells & (p_tot_grid > 0)
+
+# --- (a) present-day capacity: IRENA nationals spread by Hu ratios (GW/cell) --
+# Onshore wind + solar over the onshore mask; offshore wind over the EEZ mask;
+# each technology distributed within a country in proportion to its Hu potential.
+def _spread(nat_mw, pot_field, cell_mask):
+    tot = float(pot_field.where(cell_mask, 0.0).sum())
+    if tot <= 0:
+        return xr.zeros_like(pot_field)
+    return nat_mw * pot_field.where(cell_mask, 0.0) / tot
+
+cap_present = xr.zeros_like(pot_grid['pot_on'])
+for code in CODES:
+    cap_present = cap_present + (
+        _spread(IC.loc[code, 'Onshore Wind (MW)'],  pot_grid['pot_on'],  masks_on[code]) +
+        _spread(IC.loc[code, 'Solar (MW)'],         pot_grid['pot_pv'],  masks_on[code]) +
+        _spread(IC.loc[code, 'Offshore Wind (MW)'], pot_grid['pot_off'], masks_off[code]))
+cap_present = (cap_present / 1e3).where(study_cells)          # -> GW
+
+# --- (b) fully-built capacity: Hu absolute potential (GW/cell) ---------------
+cap_full = (p_tot_grid / 1e3).where(study_cells)
+
+
+# %%
+# --- (c)-(f) grid-cell blended-CF fields (cached) ---------------------------
+def compute_supply_grid(lat_block=20):
+    """Mean CF, CV, and event frequency under an absolute floor and a
+    fraction-of-local-mean floor.  The blend uses local Hu technology shares,
+    identical to cf_blend in 03_DF_supp_ID.py."""
+    p_safe = p_tot_grid.where(p_tot_grid > 0, 1.0)
+    w_on  = pot_grid['pot_on']  / p_safe
+    w_off = pot_grid['pot_off'] / p_safe
+    w_sol = pot_grid['pot_pv']  / p_safe
+
+    n_lat, n_lon = CF_wind_dly.sizes['latitude'], CF_wind_dly.sizes['longitude']
+    mean_cf  = np.full((n_lat, n_lon), np.nan, np.float32)
+    cv       = np.full((n_lat, n_lon), np.nan, np.float32)
+    freq_abs = np.full((n_lat, n_lon), np.nan, np.float32)
+    freq_rel = np.full((n_lat, n_lon), np.nan, np.float32)
 
     for i0 in range(0, n_lat, lat_block):
         i1 = min(i0 + lat_block, n_lat)
-        blk = (W_WIND * wind.isel(latitude=slice(i0, i1)) +
-               W_SOL * solar.isel(latitude=slice(i0, i1))).astype('float32').compute()
-        arr = blk.values.reshape(n_t, -1)          # (time, cells_in_block)
-        print(f"  cells {i0}-{i1} of {n_lat} …", flush=True)
-
+        sl = dict(latitude=slice(i0, i1))
+        blend = (w_on.isel(**sl)  * CF_wind_dly.isel(**sl) +
+                 w_off.isel(**sl) * CF_wind_dly.isel(**sl) +
+                 w_sol.isel(**sl) * CF_solar_dly.isel(**sl)).astype('float32').compute()
+        arr = blend.values.reshape(blend.sizes['time'], -1)      # (time, cells_in_block)
+        print(f"  FIG5 grid cells {i0}-{i1} of {n_lat} ...", flush=True)
         for k in range(arr.shape[1]):
             x = arr[:, k]
-            if not np.isfinite(x).any():
+            xw = x[winter_ok_cf]
+            if not np.isfinite(xw).any():
                 continue
-            # In 'absolute' mode the map reads as resource geography (where is
-            # output low in absolute terms).  In 'fraction_of_mean' mode it reads
-            # as reliability relative to the local norm (where does output
-            # collapse furthest below what that location usually delivers).
-            thr = (ABS_CF_THRESHOLD if CF_THRESHOLD_MODE == 'absolute'
-                   else CF_MEAN_FRACTION * float(np.nanmean(x[winter_ok])))
-            ev = detect_absolute(x, winter_ok, thr, 'lower')
+            m = float(np.nanmean(xw))
             ii, jj = i0 + k // n_lon, k % n_lon
-            freq[ii, jj] = len(ev) / N_WINTERS
-            if ev:
-                sev[ii, jj] = float(np.mean([e['severity'] for e in ev]))
-                dur[ii, jj] = float(np.mean([e['duration'] for e in ev]))
-            else:
-                sev[ii, jj] = 0.0
+            mean_cf[ii, jj] = m
+            cv[ii, jj]      = float(np.nanstd(xw) / m) if m > 0 else np.nan
+            freq_abs[ii, jj] = len(detect_absolute(x, winter_ok_cf, GRID_ABS_CF, 'lower')) / N_WINTERS_CF
+            freq_rel[ii, jj] = len(detect_absolute(x, winter_ok_cf, GRID_REL_FRAC * m, 'lower')) / N_WINTERS_CF
 
-    coords = {'latitude': wind.latitude, 'longitude': wind.longitude}
-    ds = xr.Dataset(
-        {'freq': (('latitude', 'longitude'), freq),
-         'mean_S': (('latitude', 'longitude'), sev),
-         'mean_duration': (('latitude', 'longitude'), dur)},
-        coords=coords,
-        attrs={'cf_threshold': ABS_CF_THRESHOLD, 'w_wind': W_WIND, 'w_solar': W_SOL,
-               'season': 'NDJFM', 'max_gap': MAX_GAP, 'min_duration': MIN_DURATION,
-               'n_winters': N_WINTERS,
-               'threshold_mode': CF_THRESHOLD_MODE,
-               'cf_mean_fraction': CF_MEAN_FRACTION,
-               'description': 'Per-cell supply-side climatology under an absolute '
-                              'shortfall criterion, IRENA-aggregate wind/solar mix. '
-                              'Written by 06_results.py.'})
-    return ds
+    coords = {'latitude': CF_wind_dly.latitude, 'longitude': CF_wind_dly.longitude}
+    return xr.Dataset({'mean_cf':  (('latitude', 'longitude'), mean_cf),
+                       'cv':       (('latitude', 'longitude'), cv),
+                       'freq_abs': (('latitude', 'longitude'), freq_abs),
+                       'freq_rel': (('latitude', 'longitude'), freq_rel)},
+                      coords=coords,
+                      attrs={'grid_abs_cf': GRID_ABS_CF, 'grid_rel_frac': GRID_REL_FRAC,
+                             'season': 'NDJFM', 'n_winters': N_WINTERS_CF,
+                             'blend': 'local Hu potential shares (as in 03)'})
 
-
-if CELL_CACHE.exists():
-    print(f"\nLoading cached grid-cell climatology: {CELL_CACHE}")
-    cell_stats = xr.open_dataset(CELL_CACHE)
+# NOTE: this writes a small .nc CACHE (grid stats, not a figure) so re-runs are
+# fast.  Delete GRID_CACHE to force a recompute after changing the thresholds.
+if GRID_CACHE.exists():
+    print(f"Loading cached FIG 5 grid stats: {GRID_CACHE}")
+    grid_stats = xr.open_dataset(GRID_CACHE)
 else:
-    print("\nComputing grid-cell climatology (cached after first run)...")
-    cell_stats = compute_cell_climatology()
-    CELL_CACHE.parent.mkdir(parents=True, exist_ok=True)
-    cell_stats.to_netcdf(CELL_CACHE)
-    print(f"  Cached → {CELL_CACHE}")
+    print("Computing FIG 5 grid stats (cached after first run)...")
+    grid_stats = compute_supply_grid()
+    GRID_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    grid_stats.to_netcdf(GRID_CACHE)
+    print(f"  Cached -> {GRID_CACHE}")
 
-domain_mask = study_domain_mask(cell_stats['freq'])
+for _v in ['mean_cf', 'cv', 'freq_abs', 'freq_rel']:
+    grid_stats[_v] = grid_stats[_v].where(study_cells)
 
 
 # %%
@@ -575,77 +663,93 @@ print(supply_country.round(3).to_string())
 
 # %%
 # =================================================================
-# FIGURE 1 — Supply-side weather risk (present-day IRENA fleet)
-#   A  grid-cell event frequency          (contourf)
-#   B  grid-cell mean event severity      (contourf)
-#   C  country event frequency            (choropleth)
-#   D  country mean event severity        (choropleth)
-# All four panels are purely meteorological: no demand, no residual load.
+# Paper FIG 5 — panels (shown individually via plt.show(), NOT saved)
 # =================================================================
-print("\nFIG 1 — supply-side weather risk...")
+# Map style copied from 03_DF_supp_ID.py::format_capacity_map so every panel
+# matches the "Maximum installable capacity" figures.  Run each cell below on its
+# own to judge which panels to keep and how to assemble the final layout.
+from cartopy.mpl.gridliner import LONGITUDE_FORMATTER, LATITUDE_FORMATTER
 
-fig = plt.figure(figsize=(13.5, 12))
-gs = gridspec.GridSpec(2, 2, figure=fig, hspace=0.10, wspace=0.10)
-ax_a = fig.add_subplot(gs[0, 0], projection=PROJ)
-ax_b = fig.add_subplot(gs[0, 1], projection=PROJ)
-ax_c = fig.add_subplot(gs[1, 0], projection=PROJ)
-ax_d = fig.add_subplot(gs[1, 1], projection=PROJ)
+_cgdf_bbox = shapely.geometry.box(MAP_EXTENT[0] - 3, MAP_EXTENT[2] - 3,
+                                  MAP_EXTENT[1] + 3, MAP_EXTENT[3] + 3)
+countries_gdf = gpd.read_file(str(COUNTRIES_SHP), bbox=_cgdf_bbox)
 
-# --- A: grid-cell frequency ---
-freq_da = cell_stats['freq'].where(domain_mask)
-style_map_ax(ax_a)
-lv_f = np.linspace(0, float(np.nanpercentile(freq_da.values, 98)), 11)
-cf_a = ax_a.contourf(freq_da.longitude, freq_da.latitude, freq_da, levels=lv_f,
-                     cmap='YlOrRd', extend='max', transform=ccrs.PlateCarree(), zorder=1)
-cb_a = fig.colorbar(cf_a, ax=ax_a, orientation='horizontal', fraction=0.05, pad=0.04)
-cb_a.set_label('Low-generation events per winter', fontsize=9)
-cb_a.ax.tick_params(labelsize=8)
-ax_a.set_title(f"A — Grid-cell event frequency ({THR_LABEL})",
-               fontsize=11, fontweight='bold')
 
-# --- B: grid-cell severity ---
-sev_da = cell_stats['mean_S'].where(domain_mask)
-style_map_ax(ax_b)
-lv_s = np.linspace(0, float(np.nanpercentile(sev_da.values, 98)), 11)
-cf_b = ax_b.contourf(sev_da.longitude, sev_da.latitude, sev_da, levels=lv_s,
-                     cmap='YlOrBr', extend='max', transform=ccrs.PlateCarree(), zorder=1)
-cb_b = fig.colorbar(cf_b, ax=ax_b, orientation='horizontal', fraction=0.05, pad=0.04)
-cb_b.set_label('Mean event severity (CF-deficit days)', fontsize=9)
-cb_b.ax.tick_params(labelsize=8)
-ax_b.set_title("B — Grid-cell event severity", fontsize=11, fontweight='bold')
+def format_capacity_map(ax, extent=MAP_EXTENT):
+    """The common project map style (03_DF_supp_ID.py)."""
+    ax.add_feature(cfeature.OCEAN.with_scale('10m'), facecolor=OCEAN_COLOR, zorder=0)
+    ax.add_feature(cfeature.LAND.with_scale('10m'),  facecolor='0.93', zorder=0)
+    ax.add_geometries(countries_gdf.geometry, crs=ccrs.PlateCarree(),
+                      facecolor='none', edgecolor='0.35', linewidth=0.5, zorder=3)
+    ax.add_feature(cfeature.BORDERS.with_scale('10m'), lw=0.9, edgecolor='0.15', zorder=4)
+    ax.add_feature(cfeature.COASTLINE.with_scale('10m'), lw=0.9, zorder=4)
+    ax.set_extent(extent, crs=ccrs.PlateCarree())
+    gl = ax.gridlines(crs=ccrs.PlateCarree(), draw_labels=True, lw=0.25,
+                      color='0.6', alpha=0.5, ls='--')
+    gl.top_labels = gl.right_labels = False
+    gl.xformatter, gl.yformatter = LONGITUDE_FORMATTER, LATITUDE_FORMATTER
+    gl.xlabel_style = gl.ylabel_style = {'size': 7}
 
-# --- C: country frequency ---
-freq_c = supply_country['events_per_winter'].to_dict()
-n_c = supply_country['n_events'].fillna(0).to_dict()
-norm_c = Normalize(vmin=0, vmax=np.nanmax(list(freq_c.values())))
-plot_choropleth_panel(ax_c, freq_c, plt.get_cmap('YlOrRd'), norm_c,
-                      "C — Country event frequency (IRENA fleet)",
-                      fmt="{:.2f}", counts_by_code=n_c)
-sm_c = cm.ScalarMappable(cmap='YlOrRd', norm=norm_c)
-cb_c = fig.colorbar(sm_c, ax=ax_c, orientation='horizontal', fraction=0.05, pad=0.04)
-cb_c.set_label('Low-generation events per winter', fontsize=9)
-cb_c.ax.tick_params(labelsize=8)
 
-# --- D: country severity ---
-sev_c = supply_country['mean_severity'].to_dict()
-norm_d = Normalize(vmin=0, vmax=np.nanmax(list(sev_c.values())))
-plot_choropleth_panel(ax_d, sev_c, plt.get_cmap('YlOrBr'), norm_d,
-                      "D — Country event severity (IRENA fleet)",
-                      fmt="{:.3f}", counts_by_code=n_c)
-sm_d = cm.ScalarMappable(cmap='YlOrBr', norm=norm_d)
-cb_d = fig.colorbar(sm_d, ax=ax_d, orientation='horizontal', fraction=0.05, pad=0.04)
-cb_d.set_label('Mean event severity (CF-deficit days)', fontsize=9)
-cb_d.ax.tick_params(labelsize=8)
+def supply_panel(field, title, cbar_label, cmap, vmax=None, vmin=0, levels=12):
+    """One standalone LAEA filled-contour map in the 03 capacity-map style."""
+    lon2d, lat2d = np.meshgrid(field.longitude.values, field.latitude.values)
+    finite = field.values[np.isfinite(field.values)]
+    if vmax is None:
+        vmax = float(np.nanpercentile(finite, 99)) if finite.size else 1.0
+    fig, ax = plt.subplots(figsize=(7.2, 7.2), subplot_kw={'projection': LAEA})
+    format_capacity_map(ax)
+    cf = ax.contourf(lon2d, lat2d, field.values, levels=levels, vmin=vmin, vmax=vmax,
+                     cmap=cmap, transform=ccrs.PlateCarree(), extend='max', zorder=2)
+    cb = fig.colorbar(cf, ax=ax, orientation='vertical', pad=0.03, shrink=0.82, aspect=22)
+    cb.set_label(cbar_label, fontsize=9)
+    cb.ax.tick_params(labelsize=8)
+    ax.set_title(title, fontsize=11, pad=8)
+    plt.tight_layout()
+    plt.show()
+    return fig
 
-fig.suptitle("Weather-driven low-generation risk under the present-day renewable fleet\n"
-             f"{THR_LABEL.replace('$_{sys}$', '_sys')}, NDJFM "
-             f"{valid_winters[0]}–{valid_winters[-1]}\n"
-             f"grid-cell panels: uniform IRENA aggregate mix "
-             f"({W_WIND:.0%} wind / {W_SOL:.0%} solar) — country panels: national mixes",
-             fontsize=12, y=0.95)
-save_fig(fig, "fig01_supply_weather_risk")
-plt.show()
-plt.close()
+
+# Shared capacity scale so (a) and (b) are comparable between countries.
+_cap_all = np.concatenate([cap_present.values[np.isfinite(cap_present.values)],
+                           cap_full.values[np.isfinite(cap_full.values)]])
+_cap_vmax = float(np.nanpercentile(_cap_all, 99)) if _cap_all.size else 1.0
+
+# %%
+# (a) present-day installed capacity
+supply_panel(cap_present,
+             "(a) Present-day installed capacity\n(IRENA 2024, Hu spatial texture)",
+             "Installed capacity (GW / cell)", 'YlGnBu', vmax=_cap_vmax)
+
+# %%
+# (b) fully-built installable capacity
+supply_panel(cap_full,
+             "(b) Fully-built installable capacity\n(Hu maximum potential)",
+             "Installable capacity (GW / cell)", 'YlGnBu', vmax=_cap_vmax)
+
+# %%
+# (c) mean winter blended capacity factor (resource baseline)
+supply_panel(grid_stats['mean_cf'],
+             "(c) Mean NDJFM blended capacity factor",
+             "Mean winter blended CF", 'viridis')
+
+# %%
+# (d) blended-CF variability (coefficient of variation)
+supply_panel(grid_stats['cv'],
+             "(d) Winter blended-CF variability (CV)",
+             "Coefficient of variation (σ / μ)", 'plasma')
+
+# %%
+# (e) absolute low-CF frequency
+supply_panel(grid_stats['freq_abs'],
+             f"(e) Low-CF frequency — absolute floor\n(blended CF < {GRID_ABS_CF:.2f})",
+             "Events per winter", 'inferno_r')
+
+# %%
+# (f) relative low-CF frequency (fraction of local winter mean; not a percentile)
+supply_panel(grid_stats['freq_rel'],
+             f"(f) Low-CF frequency — relative to local norm\n(< {GRID_REL_FRAC:.0%} of cell winter mean)",
+             "Events per winter", 'inferno_r')
 
 
 # %%

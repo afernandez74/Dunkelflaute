@@ -28,7 +28,7 @@ import xarray as xr
 #%%
 # Config and params
 
-SCENARIO      = 'present_day'      # 'present_day' or 'fully_built'
+SCENARIO      = 'fully_built'      # 'present_day' or 'fully_built'
 
 WINTER_MONTHS = [11, 12, 1, 2, 3]  # extended winter (NDJFM)
 RL_PCT        = 90                 # upper-tail percentile for relative RL events (%)
@@ -48,7 +48,7 @@ COUNTRIES = {                      # Natural Earth ADMIN name -> code
 }
 
 # supply catalogue track to compare present-day RL against
-SUPPLY_TRACK = 'IRENA_Relative_10pct'
+SUPPLY_TRACK = 'MaxPot_Relative_10pct' if SCENARIO == 'fully_built' else 'IRENA_Relative_10pct'
 
 # I/O
 CF_DAILY_DIR      = Path('./../Results/CF_daily')
@@ -364,9 +364,28 @@ print(overlap_df.round(2).to_string(index=False))
 print(f"\nDomain-mean Jaccard: {overlap_df['jaccard'].mean():.2f} | "
       f"mean RL-day recall by supply: {overlap_df['frac_rl_in_supply'].mean():.2f}")
 #%%
+# Save results per-country scenario summary (runs once per SCENARIO)
+
+wd = winter_ok
+firm_gwh, rl0_frac = {}, {}
+for code in common_ctry:
+    R = rl_df[code].values[wd]
+    firm_gwh[code] = np.clip(R, 0, None).sum() * 24 / 1e3 / n_winters   # GWh / winter (storage/imports must cover)
+    rl0_frac[code] = (R > 0).mean()                                     # fraction of winter days in deficit
+
+summary = (var_df.set_index('country')[['std_ratio', 'corr_D_S']]
+           .join(overlap_df.set_index('country')[['frac_rl_in_supply', 'jaccard']])
+           .join(cond_df[['amplification']])
+           .assign(firm_gwh_per_winter=pd.Series(firm_gwh),
+                   rl0_day_frac=pd.Series(rl0_frac),
+                   scenario=SCENARIO))
+summary.to_parquet(OUT_DIR / f'scenario_summary_{SCENARIO}.parquet')
+print(summary.round(2).to_string())
+
+#%%
 # Sanity check: DE residual load with detected events
 
-sample = 'FR'
+sample = 'DE'
 t0, t1 = pd.Timestamp('2016-10-01'), pd.Timestamp('2019-04-01')
 m = (times >= t0) & (times <= t1)
 thr = np.nanpercentile(rl_df[sample].values[winter_ok], RL_PCT)
@@ -489,4 +508,145 @@ for code in common_ctry:
         rl_in_demand = (dem_bool[code].values & b).sum() / n if n else np.nan,
     ))
 print(pd.DataFrame(rows).round(2).to_string(index=False))
+
+#%%
+# Event design-plane: peak RL power vs accumulated deficit
+
+ev = master_rl_df[master_rl_df['track'] == 'RL_Relative_90pct'].copy()
+ev['peak_GW']    = ev['peak_val']   / 1e3
+ev['excess_GWd'] = ev['excess_sum'] / 1e3   # GW·days above 90th-pct threshold
+
+fig, ax = plt.subplots(figsize=(8, 6))
+for code in common_ctry:
+    e = ev[ev['country'] == code]
+    ax.scatter(e['peak_GW'], e['excess_GWd'], s=20 + 6*e['duration'], alpha=0.6, label=code)
+ax.set_xlabel('Peak residual load (GW)')
+ax.set_ylabel('Accumulated deficit above threshold (GW·days)')
+ax.set_title('Present-day RL event design-plane (size = duration)', fontweight='bold')
+ax.legend(ncol=2, fontsize=8)
+plt.tight_layout(); plt.show()
+# %%
+# Compound fraction: partition RL event-days by driver coincidence
+
+rows = []
+for code in common_ctry:
+    r = rl_bool[code].values          # RL event day
+    s = sup_bool[code].values         # supply-low day (from 03)
+    d = dem_bool[code].values         # demand-high day (from cross-check cell)
+    n = r.sum()
+    if n == 0:
+        continue
+    rows.append(dict(country=code,
+                     both        =(r & s & d).sum()  / n,   # genuine compound days
+                     supply_only =(r & s & ~d).sum() / n,
+                     demand_only =(r & ~s & d).sum() / n,
+                     neither     =(r & ~s & ~d).sum()/ n))
+compound_frac = pd.DataFrame(rows)
+print(compound_frac.round(2).to_string(index=False))
+# %%
+
+# Spatial concurrence — pairwise Jaccard of RL events (vs supply events)
+
+def pairwise_jaccard(bool_df):
+    cols = list(bool_df.columns)
+    J = pd.DataFrame(0.0, index=cols, columns=cols)
+    for c1 in cols:
+        for c2 in cols:
+            a, b = bool_df[c1].values, bool_df[c2].values
+            u = (a | b).sum()
+            J.loc[c1, c2] = (a & b).sum() / u if u else 0.0
+    return J
+
+J_rl  = pairwise_jaccard(rl_bool)
+J_sup = pairwise_jaccard(sup_bool)
+
+# off-diagonal means (self-Jaccard = 1 excluded)
+def offdiag_mean(J):
+    v = J.values.copy(); np.fill_diagonal(v, np.nan)
+    return np.nanmean(v)
+
+print(f"Mean pairwise RL Jaccard:     {offdiag_mean(J_rl):.2f}")
+print(f"Mean pairwise supply Jaccard: {offdiag_mean(J_sup):.2f}")
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+for ax, J, ttl in [(axes[0], J_sup, 'Supply-only events'),
+                   (axes[1], J_rl,  'Residual-load events')]:
+    cax = ax.matshow(J.values, cmap='Blues', vmin=0, vmax=1)
+    for i in range(len(J)):
+        for j in range(len(J)):
+            val = J.iloc[i, j]
+            ax.text(j, i, f"{val:.2f}", ha='center', va='center',
+                    color='black' if val < 0.6 else 'white', fontsize=9)
+    ax.set_xticks(range(len(J))); ax.set_yticks(range(len(J)))
+    ax.set_xticklabels(J.columns); ax.set_yticklabels(J.index)
+    ax.xaxis.set_ticks_position('bottom')
+    ax.set_title(ttl, fontweight='bold', pad=10)
+fig.colorbar(cax, ax=axes, shrink=0.7, label='Jaccard index')
+plt.show()
+#%%
+# Concurrence distribution + conditional concurrence (interconnection relevance)
+
+n_ctry = len(common_ctry)
+rl_conc  = rl_bool.sum(axis=1)       # countries simultaneously in RL event, per winter day
+sup_conc = sup_bool.sum(axis=1)
+
+# distribution over active days (>=1 country) — normalized to fractions of active days
+def active_dist(conc):
+    a = conc[conc > 0].value_counts().sort_index()
+    return (a / a.sum()).reindex(range(1, n_ctry + 1), fill_value=0.0)
+
+d_rl, d_sup = active_dist(rl_conc), active_dist(sup_conc)
+
+# conditional concurrence: given a country is in event, expected # of OTHERS also in event
+marginal = rl_bool.mean()                                  # per-country event-day rate
+cond, indep = {}, {}
+for code in common_ctry:
+    days = rl_bool[code].values
+    if days.sum() > 0:
+        others = rl_bool.loc[days].drop(columns=code).sum(axis=1)
+        cond[code]  = others.mean()
+        indep[code] = marginal.drop(code).sum()            # expectation if events independent
+cond_df = pd.DataFrame({'observed': cond, 'independent': indep})
+cond_df['amplification'] = cond_df['observed'] / cond_df['independent']
+
+print("Conditional concurrence (mean # of OTHER countries in RL event | this country in event):")
+print(cond_df.round(2).to_string())
+print(f"\nDomain mean amplification over independence: {cond_df['amplification'].mean():.1f}x")
+
+fig, ax = plt.subplots(figsize=(9, 5))
+x = np.arange(1, n_ctry + 1)
+ax.bar(x - 0.2, d_sup.values, width=0.4, label='Supply-only', color='#dd8452')
+ax.bar(x + 0.2, d_rl.values,  width=0.4, label='Residual load', color='#c44e52')
+ax.set_xlabel('Countries simultaneously in event')
+ax.set_ylabel('Fraction of active event-days')
+ax.set_title('Spatial concurrence of winter deficit events', fontweight='bold')
+ax.set_xticks(x); ax.legend(); ax.grid(axis='y', ls='--', alpha=0.3)
+plt.tight_layout(); plt.show()
+#%%
+# Pan-European systemic days: >=K countries at once, annual trend (frozen fleet -> weather-driven)
+
+SYSTEMIC_K = 5   # >=5 of 7 countries simultaneously in RL event
+
+winter_of_date = pd.Series(winter_id[winter_ok], index=winter_dates)
+systemic_day   = (rl_conc >= SYSTEMIC_K)
+
+sys_by_winter = (systemic_day.groupby(winter_of_date).sum()
+                 .reindex(valid_winters, fill_value=0))
+
+tau, p = kendalltau(np.arange(len(sys_by_winter)), sys_by_winter.values)
+print(f"Systemic days (>={SYSTEMIC_K} countries): {int(sys_by_winter.sum())} total, "
+      f"{sys_by_winter.mean():.1f}/winter")
+print(f"Worst winter: {sys_by_winter.idxmax()} ({int(sys_by_winter.max())} days)")
+print(f"Mann-Kendall tau = {tau:.2f} (p = {p:.3f})")
+
+fig, ax = plt.subplots(figsize=(11, 4.5))
+ax.bar(sys_by_winter.index, sys_by_winter.values, color='#4c72b0', edgecolor='k', width=0.7)
+z = np.polyfit(np.arange(len(sys_by_winter)), sys_by_winter.values, 1)
+ax.plot(sys_by_winter.index, np.polyval(z, np.arange(len(sys_by_winter))),
+        color='#c44e52', lw=2, label=f'trend (τ={tau:.2f}, p={p:.3f})')
+ax.set_xlabel('Winter'); ax.set_ylabel(f'Days with ≥{SYSTEMIC_K} countries in deficit')
+ax.set_title('Pan-European systemic RL days (present-day fleet, frozen)', fontweight='bold')
+ax.legend(); ax.grid(axis='y', ls='--', alpha=0.3)
+plt.tight_layout(); plt.show()
+
 # %%
