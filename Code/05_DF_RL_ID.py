@@ -28,7 +28,7 @@ import xarray as xr
 #%%
 # Config and params
 
-SCENARIO      = 'fully_built'      # 'present_day' or 'fully_built'
+SCENARIO      = 'present_day'      # 'present_day' or 'fully_built'
 
 WINTER_MONTHS = [11, 12, 1, 2, 3]  # extended winter (NDJFM)
 RL_PCT        = 90                 # upper-tail percentile for relative RL events (%)
@@ -385,7 +385,7 @@ print(summary.round(2).to_string())
 #%%
 # Sanity check: DE residual load with detected events
 
-sample = 'DE'
+sample = 'FR'
 t0, t1 = pd.Timestamp('2016-10-01'), pd.Timestamp('2019-04-01')
 m = (times >= t0) & (times <= t1)
 thr = np.nanpercentile(rl_df[sample].values[winter_ok], RL_PCT)
@@ -649,4 +649,54 @@ ax.set_title('Pan-European systemic RL days (present-day fleet, frozen)', fontwe
 ax.legend(); ax.grid(axis='y', ls='--', alpha=0.3)
 plt.tight_layout(); plt.show()
 
+#%%
+# =====================================================================
+# FIGURE 6 — Panel (a): supply-vs-RL event divergence (impact-anchoring)
+# =====================================================================
+# For each country, decompose the UNION of supply-event-days and
+# RL-event-days into three regions, normalized to that union:
+#   both        : supply screen AND residual load agree
+#   supply_only : supply lulls the grid never felt   (false alarms)
+#   rl_only     : grid-relevant RL events supply MISSED (cost of not anchoring)
+# Countries ordered left->right by std_ratio (demand-limited -> supply-limited).
+# Requires overlap_df and var_df in memory.
+
+panel_a = (overlap_df.merge(var_df[['country', 'std_ratio']], on='country')
+                     .sort_values('std_ratio')
+                     .reset_index(drop=True))
+
+union = panel_a['both'] + panel_a['supply_only'] + panel_a['rl_only']
+panel_a['f_both']   = panel_a['both']        / union
+panel_a['f_supply'] = panel_a['supply_only'] / union
+panel_a['f_rl']     = panel_a['rl_only']     / union
+
+def plot_panel_a(ax):
+    x = np.arange(len(panel_a))
+    ax.bar(x, panel_a['f_both'],   color='#4c72b0', label='Both (agreement)')
+    ax.bar(x, panel_a['f_supply'], bottom=panel_a['f_both'],
+           color='#dd8452', label='Supply-only (not grid-relevant)')
+    ax.bar(x, panel_a['f_rl'],     bottom=panel_a['f_both'] + panel_a['f_supply'],
+           color='#c44e52', label='RL-only (missed by supply)')
+
+    # supply's recall of grid-relevant events, printed above each bar
+    for xi, fr in zip(x, panel_a['frac_rl_in_supply']):
+        ax.text(xi, 1.02, f'{fr:.2f}', ha='center', va='bottom', fontsize=8, color='#333')
+    ax.text(-0.6, 1.02, 'recall→', ha='right', va='bottom', fontsize=7.5, color='#333', style='italic')
+
+    ax.set_xticks(x)
+    ax.set_xticklabels([f'{c}\nσS/σD={sr:.1f}'
+                        for c, sr in zip(panel_a['country'], panel_a['std_ratio'])],
+                       fontsize=9)
+    ax.set_ylim(0, 1.12)
+    ax.set_ylabel('Fraction of winter deficit event-days')
+    ax.set_title('Supply screening vs residual load', fontweight='bold', loc='left')
+    ax.legend(loc='lower center', bbox_to_anchor=(0.5, -0.30),
+              ncol=3, frameon=False, fontsize=8)
+    ax.margins(x=0.03)
+
+# standalone preview (final assembly: plot_panel_a(axes[...]))
+fig, ax = plt.subplots(figsize=(9, 5.5))
+plot_panel_a(ax)
+plt.tight_layout()
+plt.show()
 # %%

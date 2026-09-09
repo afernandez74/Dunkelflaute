@@ -214,9 +214,9 @@ coef = pd.DataFrame({cc: f.params for cc, f in fits.items()}).T
 # ===============================================
 
 # Added sharex=True to link the x-axes for easier visual comparison
-fig, axes = plt.subplots(2, 1, figsize=(14, 8), sharex=True)
+fig, axes = plt.subplots(3, 1, figsize=(14, 8), sharex=True)
 
-for ax, cc in zip(axes, ["FR", "NL"]):
+for ax, cc in zip(axes, ["FR", "DE", "NL"]):
     # 'load' is already restricted to the TRAIN window from earlier in the script
     obs = load[cc]
     
