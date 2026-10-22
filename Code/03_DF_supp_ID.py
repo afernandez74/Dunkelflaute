@@ -10,10 +10,15 @@ Supply-side dunkelflaute detection on combined capacity factors from ERA5 reanal
 
 Purely meteorological: events are periods of low *potential* generation.
 
-TWo country-level tracks: 
-  1. IRENA current-mix relative CF_sys (national capacity share weighting)
-  2. Max potential-weighted relative CF_sys (grid-cell MW weighted, dimensionless)
-  3. Max potential absolute fleet capacity (grid-cell MW weighted, total MW generation)
+Country-level tracks for generation and fleet CF for five scenarios: 
+- IRENA installed capacity in 2017,
+- IRENA installed capacity in 2024,
+- TYDNP forecasted capacity in 2030,
+- TYDNP forecasted capacity in 2040,
+- TYNDP forecasted capacity in 2050
+
+Spatial distribution of maximum installable capacities from Hu et al. ()
+Used to spatially distribute total country-level capacities in each case. 
 
 @author: afer
 """
@@ -31,78 +36,83 @@ import shapely
 from scipy.ndimage import label
 from scipy.stats import kendalltau
 
+from matplotlib.colors import PowerNorm
 import matplotlib.pyplot as plt
+import matplotlib.ticker as mtick
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 from cartopy.mpl.gridliner import LONGITUDE_FORMATTER, LATITUDE_FORMATTER
-
-
-
 #%%
 # Config and params
 WINTER_MONTHS = [11, 12, 1, 2, 3]   # extended winter (NDJFM)
 THRESHOLD_PCT = 10                  # lower-tail within-season percentilen threshold (%)
-GRID_CF_THRESHOLD = 0.05            # grid-cell CF threshold (%)
-SEVERE_PCT    = 5                   # severe tier percentile threshold (%)
+GRID_CF_THRESHOLD = 0.05            # grid-cell CF threshold 
+SEVERE_PCT    = 5                   # severe tier percentile threshold 
 MAX_GAP       = 1                   # Otero'22: events separated by < 2 days are pooled
 MIN_DURATION  = 3                   # Min event duration filter (days)
 
-# Absolute CF scarcity threshold (system CF floor)
-ABS_CF_THRESHOLD = 0.15
-
-# Spatial parameters
-CAP_VINTAGE = 2024              # IRENA dataset reference year
+# Years of past and forecast (TYNDP) installed capacity values per country
+SCENARIO_YEARS = [2017, 2024, 2030, 2040, 2050]
 
 # countries for analysis
 COUNTRIES = {                       # Natural Earth ADMIN name -> code
     "France"        : "FR",         # (ADMIN, not SOVEREIGNT: keeps Greenland
-    "Belgium"       : "BE",         #  out of DK and overseas out of GB/FR)
+    "Belgium"       : "BE",         #  out of DK and overseas out of UK/FR)
     "Netherlands"   : "NL",
     "Germany"       : "DE",
     "Denmark"       : "DK",
-    "United Kingdom": "GB",         # NOTE: ENTSO-E GB zone excludes Northern
+    "United Kingdom": "UK",         # NOTE: ENTSO-E GB zone excludes Northern
     "Ireland"       : "IE",         # Ireland (NI is in IE_SEM). 
 }
 
 # Input / Output Directories
 CF_DAILY_DIR  = Path('./../Results/CF_daily') # ERA5-based CF data
-OUT_DIR       = Path('./../Results/DF_supply') 
+OUT_DIR       = Path('./../Results/DF_supply/IRENA_TYNDP_scenarios') 
 FIG_DIR       = Path('./../Figures')
-IC_PATH       = Path('./../Data/IRENA_IC/IC.csv') # IRENA
-POT_PATH      = Path('./../Data/Hu_IC/CF_info_grid.csv') #
+IC_PATH = Path('./../Data/IRENA_IC/IC_IRENA_TYNDP_comb.csv') #IRENA and TYNDP
+POT_PATH      = Path('./../Data/Hu_IC/CF_info_grid.csv') 
 COUNTRIES_SHP = Path('~/CDHW_ag/Data/countries/ne_10m_admin_0_countries.shp').expanduser()
 EEZ_SHP = Path('./../Data/EEZ/World_EEZ_v12_20231025/eez_v12.shp')
 
 OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Shared settings for all maps
+PC = ccrs.PlateCarree()
+MAP_PROJECTION = ccrs.LambertAzimuthalEqualArea(
+    central_longitude=3, central_latitude=53
+)
+MAP_EXTENT = [-10, 17, 40, 61]
 #%%
-# Load installed capacity data (IRENA and Hu)
+# Load installed capacity data (IRENA and TYNDP)
 
 # ====================================================
-# IRENA (national ratios)
+# IRENA and TYNDP data load and cleanup
 # ====================================================
+
 IC = pd.read_csv(IC_PATH, index_col=0)
 
-IC.index = IC.index.map({          # IRENA country names -> short EU names
-    'France': 'FR', 'Belgium': 'BE', 'Netherlands': 'NL', 'Germany': 'DE',
-    'Denmark': 'DK', 'United Kingdom': 'GB', 'Ireland': 'IE',
-})
+#index country names to abbreviations
+IC.index = IC.index.map(COUNTRIES)
+IC.index.name = 'country'
 
-# Per-country capacity shares of the three sources
-IC_TOTAL_REN = IC[['Onshore Wind (MW)','Offshore Wind (MW)', 'Solar (MW)']].sum(axis = 1)
-W_irena = pd.DataFrame({
-    'won': IC['Onshore Wind (MW)'] / IC_TOTAL_REN,
-    'woff': IC['Offshore Wind (MW)'] / IC_TOTAL_REN,
-    'wsol': IC['Solar (MW)'] / IC_TOTAL_REN
-})
-print("IRENA 2024 National Capacity Shares:")
-print(W_irena.round(3))
+# index to year of scenario
+IC = (IC.reset_index().rename(columns={'Year':'scenario_year'}))
+IC = IC.set_index(['scenario_year', 'country'])
+
+# short column names
+tech_short_names = {'Total CAP (MW)': 'total', 'Onshore Wind (MW)':'onshore','Offshore Wind (MW)':'offshore', 'Solar (MW)':'solar'}
+IC = IC[['Total CAP (MW)', 'Onshore Wind (MW)','Offshore Wind (MW)', 'Solar (MW)']].rename(columns=tech_short_names)
+
+# calculate proportional shares per country per scenario
+IC_shares = IC[['onshore','offshore','solar']].div(IC['total'], axis=0)
 
 # ====================================================
 # Hu (maximum installable capacity)
 # ====================================================
 
+#load Hu data
 pot_raw = pd.read_csv(POT_PATH)[['lon', 'lat', 'potential_onshore', 'potential_offshore', 'potential_PV']]
-
+# xarray dataarray with data
 ds_pot = pot_raw.set_index(['lat','lon']).to_xarray()
 ds_pot = ds_pot.rename({'lat': 'latitude',
     'lon': 'longitude',
@@ -156,175 +166,6 @@ def save_panel(fig, stem):
                     facecolor='white', transparent=False, **kw)
         print(f"  Saved → {path}")
 
-# #%%
-# # Plot maps of max. installable capacity
-
-# countries_gdf = gpd.read_file(str(COUNTRIES_SHP))
-
-# LAEA = ccrs.LambertAzimuthalEqualArea(
-#     central_longitude=10.0,
-#     central_latitude=52.0
-# )
-# PC = ccrs.PlateCarree()
-
-# # 
-# DOMAIN_EXTENT = [
-#     float(pot_grid.longitude.values.min()) - 0.5,
-#     float(pot_grid.longitude.values.max()) + 0.5,
-#     float(pot_grid.latitude.values.min())  - 0.5,
-#     float(pot_grid.latitude.values.max())  + 0.5,
-# ]
-
-# def format_capacity_map(ax):
-#     """Apply the common map style used throughout the project."""
-
-#     # Background
-#     ax.add_feature(
-#         cfeature.OCEAN,
-#         facecolor='#C6E2F5',
-#         zorder=0
-#     )
-#     ax.add_feature(
-#         cfeature.LAND,
-#         facecolor='0.93',
-#         zorder=0
-#     )
-
-#     # Country boundaries
-#     ax.add_geometries(
-#         countries_gdf.geometry,
-#         crs=PC,
-#         facecolor='none',
-#         edgecolor='0.35',
-#         linewidth=0.5,
-#         zorder=3
-#     )
-
-#     # Major political/coastal boundaries
-#     ax.add_feature(
-#         cfeature.BORDERS,
-#         lw=0.9,
-#         edgecolor='0.15',
-#         zorder=4
-#     )
-#     ax.add_feature(
-#         cfeature.COASTLINE,
-#         lw=0.9,
-#         zorder=4
-#     )
-
-#     # Spatial extent
-#     ax.set_extent(DOMAIN_EXTENT, crs=PC)
-
-#     # Gridlines
-#     gl = ax.gridlines(
-#         crs=PC,
-#         draw_labels=True,
-#         lw=0.25,
-#         color='0.6',
-#         alpha=0.5,
-#         ls='--'
-#     )
-
-#     gl.top_labels = False
-#     gl.right_labels = False
-
-#     gl.xformatter = LONGITUDE_FORMATTER
-#     gl.yformatter = LATITUDE_FORMATTER
-
-#     gl.xlabel_style = {'size': 7}
-#     gl.ylabel_style = {'size': 7}
-
-# lons = pot_grid.longitude.values
-# lats = pot_grid.latitude.values
-
-# lon2d, lat2d = np.meshgrid(lons, lats)
-
-# capacity_fields = {
-#     'pot_on': {
-#         'title': 'Maximum installable onshore wind capacity',
-#         'label': 'Maximum installable capacity (GW)',
-#         'cmap': 'YlGn',
-#     },
-#     'pot_off': {
-#         'title': 'Maximum installable offshore wind capacity',
-#         'label': 'Maximum installable capacity (GW)',
-#         'cmap': 'Blues',
-#     },
-#     'pot_pv': {
-#         'title': 'Maximum installable solar PV capacity',
-#         'label': 'Maximum installable capacity (GW)',
-#         'cmap': 'YlOrBr',
-#     },
-# }
-
-# # Convert MW -> GW
-# capacity_arrays = {name: pot_grid[name].values / 1000.0 for name in capacity_fields}
-
-# # Use a robust upper limit so a small number of very large cells do not
-# # dominate the visual range.
-# vmax_capacity = {
-#     name: np.nanpercentile(arr[arr > 0], 99)
-#     if np.any(arr > 0)
-#     else 1.0
-#     for name, arr in capacity_arrays.items()
-# }
-
-# fig, axes = plt.subplots(
-#     1, 3,
-#     figsize=(16, 5.8),
-#     subplot_kw={'projection': LAEA}
-# )
-
-# for ax, (var, cfg) in zip(axes, capacity_fields.items()):
-
-#     data = capacity_arrays[var]
-
-#     format_capacity_map(ax)
-
-#     # Filled contours following the previous map style
-#     cf = ax.contourf(
-#         lon2d,
-#         lat2d,
-#         data,
-#         levels=12,
-#         vmin=0,
-#         vmax=vmax_capacity[var],
-#         cmap=cfg['cmap'],
-#         transform=PC,
-#         extend='max',
-#         zorder=2
-#     )
-
-#     # Colorbar
-#     cbar = fig.colorbar(
-#         cf,
-#         ax=ax,
-#         orientation='vertical',
-#         pad=0.03,
-#         shrink=0.82,
-#         aspect=22
-#     )
-
-#     cbar.set_label(
-#         cfg['label'],
-#         fontsize=9
-#     )
-
-#     cbar.ax.tick_params(labelsize=8)
-
-#     # Panel title
-#     ax.set_title(
-#         cfg['title'],
-#         fontsize=10,
-#         pad=8
-#     )
-
-# fig.suptitle('Maximum installable renewable energy capacity', fontsize=13, y=1.02)
-
-# plt.tight_layout()
-# # save_panel(fig, 'Max_Cap_Hu_fig')
-# plt.show()
 #%%
 # Build Country Spatial Masks (Onshore + Coastal Offshore Buffer)
 
@@ -363,7 +204,7 @@ def build_masks(template_da, land_shp_path, eez_shp_path):
 
         eez_geom = eez_gdf.loc[eez_gdf['SOVEREIGN1'] == name].union_all()
          
-        if code == 'GB':  #exclude Rockall
+        if code == 'UK':  #exclude Rockall
             eez_geom = eez_geom.difference(shapely.geometry.box(-15.0, 55.0, -10.0, 60.0))
         if code == 'DK':  #exclude Greenland and Faroe Islands
             eez_geom = eez_geom.difference(shapely.geometry.box(-75.0, 58.0, -10.0, 85.0))
@@ -384,156 +225,403 @@ def build_masks(template_da, land_shp_path, eez_shp_path):
 masks_land, masks_sea, masks_country = build_masks(CF_wind_dly.isel(time=0), COUNTRIES_SHP, EEZ_SHP)
 
 #%%
-# # ============================================================
-# # Visual check of final country masks
-# # ============================================================
+# PLOT Study region FIG: wind and solar, with linear colour scales
 
-# import matplotlib.pyplot as plt
-# import cartopy.crs as ccrs
-# import cartopy.feature as cfeature
+from matplotlib.colors import Normalize, LogNorm
+from matplotlib.lines import Line2D
+import matplotlib.patheffects as pe
 
-# # Build one categorical field:
-# # 0 = outside analysis domain
-# # 1...N = individual countries
-# mask_plot = xr.zeros_like(
-#     CF_wind_dly.isel(time=0),
-#     dtype=float
-# )
+PC = PC
+projection = MAP_PROJECTION
+circle_scale = 0.01
 
-# for i, code in enumerate(COUNTRIES.values(), start=1):
-#     mask_plot = xr.where(
-#         masks_country[code],
-#         i,
-#         mask_plot
-#     )
+positions = {
+    'FR': (2.3, 47.0), 'BE': (4.5, 50.5), 'NL': (5.3, 52.5),
+    'DE': (10.5, 51.0), 'DK': (9.5, 56.5),
+    'UK': (-2.5, 54.0), 'IE': (-8.0, 53.3)
+}
 
-# # Plot
-# fig, ax = plt.subplots(
-#     figsize=(10, 8),
-#     subplot_kw={"projection": ccrs.PlateCarree()}
-# )
-
-# p = mask_plot.where(mask_plot > 0).plot(
-#     ax=ax,
-#     transform=ccrs.PlateCarree(),
-#     levels=np.arange(0.5, len(COUNTRIES) + 1.5, 1),
-#     cmap="tab10",
-#     add_colorbar=False
-# )
-
-# # Geographic reference
-# ax.coastlines(resolution="10m", linewidth=0.8)
-# ax.add_feature(
-#     cfeature.BORDERS,
-#     linewidth=0.7,
-#     linestyle="--"
-# )
-
-# # Country labels
-# for i, code in enumerate(COUNTRIES.values(), start=1):
-#     mask = masks_country[code]
-
-#     yy, xx = np.where(mask.values)
-
-#     if len(xx) > 0:
-#         lon = float(mask.longitude.values[xx].mean())
-#         lat = float(mask.latitude.values[yy].mean())
-
-#         ax.text(
-#             lon, lat, code,
-#             ha="center",
-#             va="center",
-#             fontsize=9,
-#             fontweight="bold"
-#         )
-
-# ax.set_extent([-16, 17, 40, 61], crs=ccrs.PlateCarree())
-# ax.set_title("Final country masks")
-
-# plt.tight_layout()
-# plt.show()
-
-#%%
-# Country-level generation time series
-
-# initialize dictionaries to store results
-GEN_irena_avg, GEN_irena_hu, GEN_max_hu = {}, {}, {}
+study_land = xr.zeros_like(masks_land['FR'], dtype=bool)
+study_sea = xr.zeros_like(masks_sea['FR'], dtype=bool)
 
 for code in COUNTRIES.values():
-    # Masks
-    m_on = masks_land[code]
-    m_off = masks_sea[code]
-    m_coutry = masks_country[code]
+    study_land = study_land | masks_land[code]
+    study_sea = study_sea | masks_sea[code]
 
-    # Installed capacities per country based on IRENA database
-    IC_on, IC_off, IC_sol = IC.loc[code, ['Onshore Wind (MW)','Offshore Wind (MW)','Solar (MW)']]
+# Fill missing values only in these plotting copies
+fields = {}
+for var, mask in [('pot_on', study_land),
+                  ('pot_off', study_sea),
+                  ('pot_pv', study_land)]:
+    missing = int((pot_grid[var].isnull() & mask).sum())
+    print(f'{var}: {missing} missing cells displayed as zero')
+    fields[var] = pot_grid[var].fillna(0).where(mask) / 1000  # GW/cell
 
-    # Total country installed capacity
-    IC_total = IC_on + IC_off + IC_sol
 
-    # TRACK 1: IRENA mix (country-level average CF)
-    cf_on_mean = CF_wind_dly.where(m_on).mean(['latitude','longitude'])
-    cf_off_mean = CF_wind_dly.where(m_off).mean(['latitude','longitude'])
-    cf_solar_mean = CF_solar_dly.where(m_on).mean(['latitude','longitude'])
+# Country totals matching the Hu fields displayed on the maps (GW)
+hu_totals = pd.DataFrame({
+    var: {
+        code: float(field.where(masks_country[code]).sum())
+        for code in COUNTRIES.values()
+    }
+    for var, field in fields.items()
+})
 
-    # Absolute generation based on national capacity and raw average weather-based CF
-    GEN_irena_avg[code] = (IC_on * cf_on_mean +
-                IC_off * cf_off_mean.fillna(0.0) +
-                IC_sol * cf_solar_mean).values
+dat_IC_plt = pd.DataFrame({
+    'solar': IC['solar'],
+    'wind': IC[['onshore','offshore']].sum(axis=1)
+})
 
-    # TRACK 2:  Spatially-resolved generation potential (absolute generation) capped by IRENA installed capacities
-    
-    # mask MW potential per country 
-    pot_on = pot_grid['pot_on'].where(m_coutry, 0.0)
-    pot_off = pot_grid['pot_off'].where(m_coutry, 0.0)
-    pot_sol = pot_grid['pot_pv'].where(m_coutry, 0.0)
-    
-    # total sum of absolute installable potential MW for country
-    p_tot = float((pot_on + pot_off + pot_sol).sum())
+with plt.rc_context({'font.size': 9, 'font.family': 'DejaVu Sans'}):
+    fig, axes = plt.subplots(
+        1, 2, figsize=(12, 8),
+        subplot_kw={'projection': projection}
+    )
+    fig.subplots_adjust(left=0.04, right=0.96, top=0.90,
+                        bottom=0.29, wspace=0.08)
 
-    # Calculate shares of generation per grid cell 
-    share_on = pot_on / float(pot_on.sum())
-    share_off = pot_off / float(pot_off.sum())
-    share_sol = pot_sol / float(pot_sol.sum())
+    meshes = {}
+    panel_fields = [
+        [('pot_on', 'Blues'), ('pot_off', 'Greens')],
+        [('pot_pv', 'Oranges')]
+    ]
 
-    # Distribute IRENA installed capacities to grid via shares
-    IC_on_grid = IC_on * share_on
-    IC_off_grid = IC_off * share_off 
-    IC_sol_grid = IC_sol * share_sol
+    for i, ax in enumerate(axes):
 
-    # Generation in Track 1: 
-    GEN_irena_hu_on = (IC_on_grid * CF_wind_dly).sum(["latitude","longitude"])
-    GEN_irena_hu_off = (IC_off_grid * CF_wind_dly).sum(['latitude','longitude'])
-    GEN_irena_hu_sol = (IC_sol_grid * CF_solar_dly).sum(["latitude","longitude"])
+        ax.set_extent(MAP_EXTENT, crs=PC)
+        ax.add_feature(cfeature.OCEAN.with_scale('50m'),
+                       facecolor='#edf3f7', zorder=0)
+        ax.add_feature(cfeature.LAND.with_scale('50m'),
+                       facecolor='#e5e5e5', zorder=0)
 
-    # assign to dict
-    GEN_irena_hu[code] = (GEN_irena_hu_on + GEN_irena_hu_off + GEN_irena_hu_sol).values
+        for var, cmap in panel_fields[i]:
+            field = fields[var]
+            meshes[var] = ax.pcolormesh(
+                field.longitude, field.latitude, field.values,
+                cmap=cmap,
+                norm=Normalize(vmin=0, vmax=max(float(field.max()), 0.001)),
+                shading='auto', transform=PC, rasterized=True, zorder=2
+            )
 
-    # TRACK 3:  Spatially-resolved generation potential (absolute generation) hypothetical maximum
+        for code in COUNTRIES.values():
+            sea = masks_sea[code]
+            if bool(sea.any()):
+                ax.contour(
+                    sea.longitude, sea.latitude, sea.astype(int),
+                    levels=[0.5], colors='#456779',
+                    linewidths=0.7, linestyles='--',
+                    transform=PC, zorder=3
+                )
 
-    GEN_max_hu_on = (pot_on * CF_wind_dly).sum(["latitude","longitude"])
-    GEN_max_hu_off = (pot_off * CF_wind_dly).sum(['latitude','longitude'])
-    GEN_max_hu_sol = (pot_sol * CF_solar_dly).sum(["latitude","longitude"])
+        ax.coastlines(resolution='50m', linewidth=0.55,
+                      color='0.25', zorder=4)
+        ax.add_feature(cfeature.BORDERS.with_scale('50m'),
+                       linewidth=0.5, edgecolor='0.35', zorder=4)
 
-    # assign to dict
-    GEN_max_hu[code] = (GEN_max_hu_on + GEN_max_hu_off + GEN_max_hu_sol).values
+        technology = ['wind','solar'][i]
 
-times = pd.DatetimeIndex(CF_wind_dly.time.values)
+        # National IRENA totals for the two panels
+        installed = dat_IC_plt[technology].loc[2017]
 
-# Assign time series to pandas dataframes
-GEN_irena_avg_df = pd.DataFrame(GEN_irena_avg, index = times)
-GEN_irena_hu_df = pd.DataFrame(GEN_irena_hu, index = times)
-GEN_max_hu_df = pd.DataFrame(GEN_max_hu, index = times)
+        # 2050 potentials based on TYNDP
+        potential = dat_IC_plt[technology].loc[2050]
 
-# %%
-# 
-# Event Detection and characterization functions 
+        # Concentric circles: Hu potential and IRENA installed capacity
+        for code, (lon, lat) in positions.items():
+            capacity_i = float(installed.loc[code])
+            potential_i = float(potential.loc[code])
+
+            ax.scatter(
+                lon, lat, s=capacity_i * circle_scale,
+                facecolor='#b05aa9', edgecolor='0.15',
+                linewidth=0.7, alpha=0.85,
+                transform=PC, zorder=5
+            )
+
+            ax.scatter(
+                lon, lat, s=potential_i * circle_scale,
+                facecolor='none', edgecolor='#702568',
+                linewidth=1.3, transform=PC, zorder=6
+            )
+
+            ax.annotate(
+                code, xy=(lon, lat), xycoords=PC._as_mpl_transform(ax),
+                xytext=(0, 10), textcoords='offset points',
+                ha='center', fontsize=8, fontweight='bold', zorder=7,
+                path_effects=[pe.withStroke(linewidth=2, foreground='white')]
+            )
+        gl = ax.gridlines(
+            crs=PC, draw_labels=True, linewidth=0.35,
+            color='0.6', alpha=0.5, linestyle=':',
+            xlocs=[-10, 0, 10], ylocs=[40, 45, 50, 55, 60]
+        )
+        gl.top_labels = False
+        gl.right_labels = False
+        gl.left_labels = (i == 0)
+        gl.xlabel_style = {'size': 8}
+        gl.ylabel_style = {'size': 8}
+
+        ax.set_title(
+            ['(a)  Onshore and offshore wind', '(b)  Solar PV'][i],
+            loc='left', fontsize=11, fontweight='bold', pad=10
+        )
+        ax.spines['geo'].set_edgecolor('0.55')
+
+    # Separate, explicitly labelled linear colourbars
+    bars = [
+        ('pot_on',  [0.07, 0.21, 0.38, 0.015], 'Onshore wind'),
+        ('pot_off', [0.07, 0.13, 0.38, 0.015], 'Offshore wind'),
+        ('pot_pv',  [0.56, 0.21, 0.38, 0.015], 'Solar PV')
+    ]
+    for var, rect, title in bars:
+        cbar = fig.colorbar(
+            meshes[var], cax=fig.add_axes(rect), orientation='horizontal'
+        )
+        cbar.set_label(f'Hu {title}: maximum capacity (GW/grid cell)')
+
+    handles = [
+        Line2D([], [], marker='o', linestyle='none', markersize=8,
+               markerfacecolor='#b05aa9', markeredgecolor='0.15',
+               label=f'IRENA installed ({SCENARIO_YEARS[0]})'),
+        Line2D([], [], marker='o', linestyle='none', markersize=10,
+               markerfacecolor='none', markeredgecolor='#702568',
+               markeredgewidth=1.3, label=f'TYNDP projected {SCENARIO_YEARS[-1]} capacity')
+    ]
+
+    # Example sizes using the same scale as the map
+    for gw in [10, 100, 500]:
+        handles.append(axes[0].scatter(
+            [], [], s=gw * 1000 * circle_scale,
+            facecolor='none', edgecolor='0.4', label=f'{gw} GW'
+        ))
+
+    handles.append(Line2D(
+        [], [], color='#456779', linestyle='--', linewidth=0.8,
+        label='Offshore mask'
+    ))
+
+    fig.legend(
+        handles=handles, loc='lower center', bbox_to_anchor=(0.5, 0.005),
+        ncol=3, frameon=False, columnspacing=2, labelspacing=1.2,
+        title='National capacity totals; circle area proportional to cap'
+    )
+    fig.suptitle('Renewable deployment potential and installed capacity',
+                 fontsize=14, y=0.97)
+
+    FIG_DIR.mkdir(parents=True, exist_ok=True)
+    for ext in ['png', 'pdf', 'svg']:
+        fig.savefig(
+            FIG_DIR / f'Study_region_IRENA_TYNDP_linear.{ext}',
+            dpi=300, bbox_inches='tight', facecolor='white'
+        )
+
+    plt.show()
+#%% Installed capacities by technology and scenario year
+# Installed capacities by technology and scenario year
+
+from matplotlib.lines import Line2D
+
+scenario_years = [2017, 2024, 2030, 2040, 2050]
+country_order = ['FR', 'BE', 'NL', 'DE', 'DK', 'UK', 'IE']
+
+technology_settings = {
+    'onshore':  ('Onshore wind',  '#3366AA', 'o'),
+    'offshore': ('Offshore wind', '#009E73', 's'),
+    'solar':    ('Solar PV',      '#E69F00', '^'),
+}
+
+# IC has a MultiIndex: scenario_year, country
+capacity_data = IC.reset_index().copy()
+capacity_data['scenario_year'] = (
+    capacity_data['scenario_year'].astype(int)
+)
+
+fig, axes = plt.subplots(
+    2, 4,
+    figsize=(15, 8),
+    sharex=True,
+    sharey=False,
+    layout='constrained'
+)
+
+axes = axes.ravel()
+
+for ax, country in zip(axes, country_order):
+
+    country_data = (
+        capacity_data.loc[capacity_data['country'].eq(country)]
+        .set_index('scenario_year')
+        .reindex(scenario_years)
+    )
+
+    if country_data[list(technology_settings)].isna().any().any():
+        raise ValueError(f'Missing installed capacities for {country}.')
+
+    for technology, (label, colour, marker) in technology_settings.items():
+
+        ax.plot(
+            scenario_years,
+            country_data[technology] / 1000,
+            label=label,
+            color=colour,
+            marker=marker,
+            markersize=6,
+            linewidth=2
+        )
+
+    ax.set_title(country)
+    ax.set_xlabel('Installed-capacity scenario year')
+    ax.set_ylabel('Installed capacity (GW)')
+    ax.set_xticks(scenario_years)
+    ax.tick_params(axis='x', labelbottom=True, rotation=45)
+    ax.set_ylim(bottom=0)
+    ax.grid(alpha=0.2)
+
+# Shared legend in the unused eighth panel
+axes[-1].axis('off')
+
+handles = [
+    Line2D(
+        [], [],
+        color=colour,
+        marker=marker,
+        linewidth=2,
+        label=label
+    )
+    for label, colour, marker in technology_settings.values()
+]
+
+axes[-1].legend(
+    handles=handles,
+    title='Technology',
+    loc='upper left',
+    frameon=False
+)
+
+axes[-1].text(
+    0, 0.25,
+    '2017 and 2024: IRENA\n'
+    '2030, 2040 and 2050: TYNDP\n\n'
+    'Y-axis scales differ by country.\n'
+    'Lines connect capacity snapshots.',
+    transform=axes[-1].transAxes,
+    fontsize=10
+)
+
+fig.suptitle(
+    'Installed wind and solar capacities by country',
+    fontsize=15
+)
+
+# Optional export:
+# fig.savefig(
+#     FIG_DIR / 'Installed_capacity_scenarios_by_technology.pdf',
+#     bbox_inches='tight'
+# )
+
+plt.show()
+#%%
+# Hu-weighted country CFs per technology
+
+# tech names and cf data
+tech_input = {
+    'onshore':('pot_on',CF_wind_dly),
+    'offshore':('pot_off',CF_wind_dly),
+    'solar':('pot_pv',CF_solar_dly),
+}
+
+# dict to store technology-level CFs
+technology_cf = {
+    tech: pd.DataFrame(
+        index=times,
+        columns=list(COUNTRIES.values()),
+        dtype=float
+    )
+    for tech in tech_input.keys()
+}
+# dict to store Hu-weighted country CFs per technology
+hu_potentials = pd.DataFrame(
+    index=list(COUNTRIES.values()),
+    columns=list(tech_input),
+    dtype=float,
+)
+hu_potentials.index.name = 'country'
+
+# loop through countries and technologies to calculate technology-level CFs
+for country in COUNTRIES.values():
+    for tech, (pot_var, field) in tech_input.items():
+
+        potential = pot_grid[pot_var].fillna(0.0).where(masks_country[country],0.0)
+        potential_total = float(potential.sum())
+
+        hu_potentials.loc[country, tech] = potential_total
+
+        weights = potential / potential_total
+
+        supported_cf = field.where(potential > 0, 0.0)
+
+        country_cf = (supported_cf * weights).sum(["latitude","longitude"], skipna=False).compute()
+
+        technology_cf[tech][country] = country_cf
+
+#%%
+# Generation and fleet CF for the five capacity scenarios
+
+GEN_tracks = {}
+CF_tracks = {}
+track_capacities = {}
+
+capacities = IC.drop(columns=['total'])
+total_capacities = IC['total']
+
+for year in SCENARIO_YEARS:
+    track = str(year)
+
+    national_capacity = capacities.xs(year, level='scenario_year')
+    total_capacity = total_capacities.xs(year, level='scenario_year')
+
+    generation = sum(
+        technology_cf[tech].mul(national_capacity[tech], axis='columns')
+        for tech in tech_input.keys()
+    )
+
+    fleet_cf = generation.div(total_capacity, axis='columns')
+
+    GEN_tracks[track] = generation
+    CF_tracks[track] = fleet_cf
+    track_capacities[track] = total_capacity
+
+#%%
+# Save daily generation and fleet CF for every capacity scenario
+
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+for track in GEN_tracks:
+    generation_out = GEN_tracks[track].copy()
+    generation_out.index.name = 'date'
+    generation_out.to_parquet(
+        OUT_DIR / f'generation_{track}.parquet'
+    )
+
+    cf_out = CF_tracks[track].copy()
+    cf_out.index.name = 'date'
+    cf_out.to_parquet(
+        OUT_DIR / f'fleet_CF_{track}.parquet'
+    )
+
+# Save the installed capacities used in these calculations
+IC.to_csv(OUT_DIR / 'installed_capacities_by_scenario.csv')
+
+#%%
+# FUNCTIONS: Event Detection and characterization 
 # =================================
 
 def merge_and_filter_runs_1d(flag, max_gap, min_duration):
     """
-    Pool consecutive Trues separated by <=max_gap
-    Drop merged runs shorter than min_duration
+    Merge consecutive below-threshold runs separated by at most max_gap days,
+    then remove merged events shorter than min_duration days.
+
+    Gap days are included in the final event mask and event duration.
     
     """
     if not np.any(flag):
@@ -565,18 +653,57 @@ def merge_and_filter_runs_1d(flag, max_gap, min_duration):
 
 def detect_events_1d(x, mask_valid, thr_pct = None, max_gap = 1, min_duration = 3, abs_thr = None):
     """
-    Dunkelflaute event detection
-    Computes threshold based on masked winter time series
+    Detect below threshold events in a daily time series
+    The threshold and std are calculated using valid winter days only
     """
+
+    # Convert inputs to numpy arrays
+    x = np.asarray(x, dtype = float)
+    mask_valid = np.asarray(mask_valid, dtype = bool)
+
+
+    # checks
+    # Confirm that the series and mask align
+    if len(x) != len(mask_valid):
+        raise ValueError("x and mask_valid must have the same length")
+
+    # Confirm that there are valid winter days
+    if not np.any(mask_valid):
+        return np.zeros_like(mask_valid, dtype=bool), np.nan, np.nan
+
+    # Missing values must not be treated as ordinary gap days
+    if np.any(mask_valid & ~np.isfinite(x)):
+        raise ValueError(
+            "Missing or non-finite values found within valid winter days"
+        )
+
+    # Extract valid winter values
     wv = x[mask_valid]
-    if np.all(np.isnan(wv)):
-        return None, np.nan, np.nan
 
-    sigma = np.nanstd(wv)
-    thr = abs_thr if abs_thr is not None else np.nanpercentile(wv, thr_pct)
+    # Calculate the reference-period standard deviation
+    sigma = np.std(wv)
 
+    # Calculate percentile or absolute threshold
+    if abs_thr is not None:
+        thr = float(abs_thr)
+
+    elif thr_pct is not None:
+        thr = float(np.percentile(wv, thr_pct))
+
+    else:
+        raise ValueError(
+            "Either thr_pct or abs_thr must be provided"
+        )
+
+    # Flag days strictly below the threshold
     raw_flag = (x < thr) & mask_valid
-    evt_mask = merge_and_filter_runs_1d(raw_flag, max_gap, min_duration)
+
+    # Merge nearby runs and remove short events
+    evt_mask = merge_and_filter_runs_1d(
+        raw_flag,
+        max_gap,
+        min_duration
+    )
 
     return evt_mask, thr, sigma
 
@@ -586,561 +713,1153 @@ def characterize_events_1d(evt_mask, x, thr, sigma):
     Enforces the 'Biewald variant': gap days (where seg > thr) contribute 0 to Severity.
     """
     rows = []
+
+    x = np.asarray(x, dtype=float)
+    evt_mask = np.asarray(evt_mask, dtype=bool)
+
+    # Label each continuous event
     lab, num_features = label(evt_mask)
-    
+
     for k in range(1, num_features + 1):
+
+        # Indices belonging to the event
         idx = np.where(lab == k)[0]
-        seg = x[idx[0] : idx[-1] + 1]
-        
+
+        # Complete event segment, including merged gap days
+        seg = x[idx[0]:idx[-1] + 1]
+
+        # Only values below the threshold contribute to deficit
         shortfall = np.clip(thr - seg, 0, None)
-        
+
+        # Number of genuinely low days and merged gap days
+        n_low_days = int(np.sum(seg < thr))
+        n_gap_days = int(np.sum(seg >= thr))
+
+        # Avoid dividing by zero for constant time series
+        if np.isfinite(sigma) and sigma > 0:
+            severity = float(np.sum(shortfall) / sigma)
+        else:
+            severity = np.nan
+
         rows.append(dict(
-            start_idx   = int(idx[0]),
-            end_idx     = int(idx[-1]),
-            duration    = int(len(seg)),
-            min_val     = float(np.nanmin(seg)),
-            mean_val    = float(np.nanmean(seg)),
-            severity_S  = float(np.sum(shortfall) / sigma),
-            deficit_sum = float(np.sum(shortfall))
+            start_idx=int(idx[0]),
+            end_idx=int(idx[-1]),
+            duration=int(len(seg)),
+            n_low_days=n_low_days,
+            n_gap_days=n_gap_days,
+            min_val=float(np.min(seg)),
+            mean_val=float(np.mean(seg)),
+            severity_S=severity,
+            deficit_sum=float(np.sum(shortfall))
         ))
+
     return rows
 
-#%% 
-# run the event detection and characterization for 3 tracks
 
-def run_detection(df_series, track_name, threshold_type, thr_val, country_capacities=None):
-    """Execute detection logic across a DataFrame of countries."""
+# Wrapper for event detection
+def run_detection(df_series, track_name, source_name,
+        threshold_type, thr_val,
+        country_capacities=None,
+        value_units=None):
+    """
+    Run event detection and characterization for every country.
+
+    For generation data, an absolute CF threshold is converted to MW
+    using the capacity supplied for each country.
+    """
+
     all_events = []
-    
-    for code in df_series.columns:
-        x = df_series[code].values
-        
+
+    # Use the dataframe's own time index
+    series_times = pd.DatetimeIndex(df_series.index)
+
+    # Detection assumes one regularly spaced value per day
+    if not series_times.is_monotonic_increasing:
+        raise ValueError("Dataframe index must be in chronological order")
+
+    if series_times.has_duplicates:
+        raise ValueError("Dataframe index contains duplicate dates")
+
+    if len(series_times) > 1:
+        time_steps = series_times.to_series().diff().dropna()
+
+        if not (time_steps == pd.Timedelta(days=1)).all():
+            raise ValueError(
+                "Event detection requires a continuous daily time series"
+            )
+
+    # Recalculate winter labels from this dataframe's index
+    series_months = series_times.month.values
+    series_years = series_times.year.values
+
+    series_winter_id = np.where(
+        series_months >= 11,
+        series_years + 1,
+        series_years
+    )
+
+    series_winter_ok = (
+        np.isin(series_months, WINTER_MONTHS)
+        & np.isin(series_winter_id, valid_winters)
+    )
+
+    # Loop through countries
+    for code in COUNTRIES.values():
+
+        if code not in df_series.columns:
+            raise ValueError(
+                f"{code} is missing from {track_name} {source_name} dataframe"
+            )
+
+        x = df_series[code].to_numpy(dtype=float)
+
+        # Percentile-based detection
         if threshold_type == 'percentile':
+
             evt_mask, thr, sigma = detect_events_1d(
-                x, winter_ok, thr_pct=thr_val, max_gap=MAX_GAP, min_duration=MIN_DURATION
+                x,
+                series_winter_ok,
+                thr_pct=thr_val,
+                max_gap=MAX_GAP,
+                min_duration=MIN_DURATION
             )
+
+        # Absolute-CF-threshold detection
         elif threshold_type == 'absolute':
-            # Translate dimensionless CF floor into an absolute MW floor
-            floor = (thr_val * country_capacities[code]) if country_capacities else thr_val
+
+            if source_name == 'generation':
+
+                if country_capacities is None:
+                    raise ValueError(
+                        "Generation detection requires country capacities "
+                        "to convert the CF threshold to MW"
+                    )
+
+                # Works with either a pandas Series or dictionary
+                if isinstance(country_capacities, pd.Series):
+                    country_capacity = country_capacities.loc[code]
+                else:
+                    country_capacity = country_capacities[code]
+
+                # Convert CF threshold to daily mean generation in MW
+                absolute_threshold = (
+                    float(thr_val) * float(country_capacity)
+                )
+
+            else:
+                # CF input is already dimensionless
+                absolute_threshold = float(thr_val)
+
             evt_mask, thr, sigma = detect_events_1d(
-                x, winter_ok, abs_thr=floor, max_gap=MAX_GAP, min_duration=MIN_DURATION
+                x,
+                series_winter_ok,
+                abs_thr=absolute_threshold,
+                max_gap=MAX_GAP,
+                min_duration=MIN_DURATION
             )
-            
-        ev_rows = characterize_events_1d(evt_mask, x, thr, sigma)
-        
-        for r in ev_rows:
-            s_idx = r.pop('start_idx')
-            e_idx = r.pop('end_idx')
-            
+
+        else:
+            raise ValueError(
+                "threshold_type must be 'percentile' or 'absolute'"
+            )
+
+        # Characterize every detected event
+        event_rows = characterize_events_1d(
+            evt_mask,
+            x,
+            thr,
+            sigma
+        )
+
+        for row in event_rows:
+
+            start_idx = row.pop('start_idx')
+            end_idx = row.pop('end_idx')
+
             all_events.append(dict(
-                country    = code,
-                track      = track_name,
-                start_date = times[s_idx],
-                end_date   = times[e_idx],
-                winter     = int(winter_id[s_idx]),
-                threshold  = float(thr),
-                **r
+                country=code,
+                track=track_name,
+                source=source_name,
+                threshold_type=threshold_type,
+                threshold_value=float(thr_val),
+                units=value_units,
+                winter=int(series_winter_id[start_idx]),
+                start=series_times[start_idx],
+                end=series_times[end_idx],
+                threshold=float(thr),
+                **row
             ))
-            
-    return pd.DataFrame(all_events)
 
-
-#%%
-# Run detection for 3 tracks
-tracks = {1: GEN_irena_avg_df,
-          2: GEN_irena_hu_df,
-          3: GEN_max_hu_df}
-
-events = pd.concat([run_detection(df, name, 'percentile', THRESHOLD_PCT)
-                    for name, df in tracks.items()], ignore_index=True)
-
-#%% 
-# Annual metrics
-index = pd.MultiIndex.from_product(
-    [COUNTRIES.values(), tracks.keys(), valid_winters],
-    names=['country', 'track', 'winter'])
-
-annual = events.groupby(['country', 'track', 'winter']).agg(
-    n_events=('duration', 'size'),
-    severity=('severity_S', 'sum'),
-    duration=('duration', 'mean')
-).reindex(index)
-
-annual[['n_events', 'severity']] = annual[['n_events', 'severity']].fillna(0)
-annual = annual.reset_index()
-# annual.to_csv(OUT_DIR / 'DF_supply_annual.csv', index=False)
-
-#%%
-# Fleet capacity factors (CF) and fixed reference winters
-
-# max capacity for each country based on Hu dataset (MW)
-cap_max = pd.Series({
-    code: float(pot_grid[['pot_on', 'pot_off', 'pot_pv']]
-                .to_array().where(masks_country[code], 0).sum())
-    for code in COUNTRIES.values()
-})
-
-capacities = {1: IC_TOTAL_REN, 2: IC_TOTAL_REN, 3: cap_max}
-cf_tracks = {}
-
-for track, df in tracks.items():
-    cap = capacities[track].reindex(df.columns)
-    cf_tracks[track] = df.div(cap, axis=1)
-    # cf_tracks[track].to_csv(OUT_DIR / f'CF_track_{track}.csv')
-
-REF_FIRST, REF_LAST = 1991, 2020  # winter 1991 = Nov 1990 to Mar 1991
-reference = winter_ok & (winter_id >= REF_FIRST) & (winter_id <= REF_LAST)
-
-# Check complete daily coverage and finite winter values
-assert times.equals(pd.date_range(times[0], times[-1], freq='D'))
-for winter in valid_winters:
-    expected = pd.date_range(f'{winter-1}-11-01', f'{winter}-03-31')
-    assert expected.isin(times).all(), f'Incomplete winter: {winter}'
-
-for df in cf_tracks.values():
-    assert np.isfinite(df.loc[winter_ok].values).all(), 'Missing winter CF'
-#%%
-# Gridcell level analysis 
-print("Starting gridcell-level compound spatial hazard analysis...")
-
-GRID_CF_THRESHOLD = 0.10  # 10% fixed efficiency threshold
-
-# 1. Define complete study domain
-study_domain = xr.full_like(masks_on['FR'], False, dtype=bool)
-for code in COUNTRIES.values():
-    study_domain = study_domain | masks_on[code] | masks_off[code]
-
-# 2. Calculate local gridcell technology weights based on Max Potential
-p_tot = pot_grid['pot_on'] + pot_grid['pot_off'] + pot_grid['pot_pv']
-p_tot_safe = p_tot.where(p_tot > 0, 1.0)
-
-w_on  = pot_grid['pot_on'] / p_tot_safe
-w_off = pot_grid['pot_off'] / p_tot_safe
-w_sol = pot_grid['pot_pv'] / p_tot_safe
-
-# 3. Compute blended capacity factor array
-cf_blend = (w_on * CF_wind_dly) + (w_off * CF_wind_dly) + (w_sol * CF_solar_dly)
-
-# 4. Transpose dimensions to NumPy arrays (time, latitude, longitude)
-lats = CF_wind_dly.latitude.values
-lons = CF_wind_dly.longitude.values
-
-cf_wind_np  = CF_wind_dly.transpose('time', 'latitude', 'longitude').values
-cf_solar_np = CF_solar_dly.transpose('time', 'latitude', 'longitude').values
-cf_blend_np = cf_blend.transpose('time', 'latitude', 'longitude').values
-
-domain_mask = (study_domain.values) & (p_tot.values > 0)
-valid_i, valid_j = np.where(domain_mask)
-
-# 5. Initialize result grids for ALL metrics and ALL tracks
-# Frequency
-freq_wind  = np.full((len(lats), len(lons)), np.nan)
-freq_solar = np.full((len(lats), len(lons)), np.nan)
-freq_blend = np.full((len(lats), len(lons)), np.nan)
-freq_comp  = np.full((len(lats), len(lons)), np.nan)
-
-# Duration
-dur_wind  = np.full((len(lats), len(lons)), np.nan)
-dur_solar = np.full((len(lats), len(lons)), np.nan)
-dur_blend = np.full((len(lats), len(lons)), np.nan)
-dur_comp  = np.full((len(lats), len(lons)), np.nan)
-
-# Severity (S) - Standardized Shortfall
-sev_wind  = np.full((len(lats), len(lons)), np.nan)
-sev_solar = np.full((len(lats), len(lons)), np.nan)
-sev_blend = np.full((len(lats), len(lons)), np.nan)
-sev_comp  = np.full((len(lats), len(lons)), np.nan)
-
-# 6. Spatial Loop
-for i, j in zip(valid_i, valid_j):
-    ts_w = cf_wind_np[:, i, j]
-    ts_s = cf_solar_np[:, i, j]
-    ts_b = cf_blend_np[:, i, j]
-    
-    # Helper to calculate std dev safely for standardized severity[cite: 1]
-    sigma_w = np.nanstd(ts_w[winter_ok])
-    sigma_s = np.nanstd(ts_s[winter_ok])
-    sigma_b = np.nanstd(ts_b[winter_ok])
-    
-    # --- Track 1: Wind-Only Drought (CF_wind < 0.10) ---
-    mask_w, _, _ = detect_events_1d(ts_w, winter_ok, abs_thr=GRID_CF_THRESHOLD, max_gap=MAX_GAP, min_duration=MIN_DURATION)
-    if mask_w is not None and np.any(mask_w):
-        rows_w = characterize_events_1d(mask_w, ts_w, GRID_CF_THRESHOLD, sigma_w)
-        freq_wind[i, j] = len(rows_w) / n_winters
-        dur_wind[i, j]  = np.mean([r['duration'] for r in rows_w])
-        sev_wind[i, j]  = np.mean([r['severity_S'] for r in rows_w])
-    else:
-        freq_wind[i, j] = 0; dur_wind[i, j] = 0; sev_wind[i, j] = 0
-
-    # --- Track 2: Solar-Only Drought (CF_solar < 0.10) ---
-    mask_s, _, _ = detect_events_1d(ts_s, winter_ok, abs_thr=GRID_CF_THRESHOLD, max_gap=MAX_GAP, min_duration=MIN_DURATION)
-    if mask_s is not None and np.any(mask_s):
-        rows_s = characterize_events_1d(mask_s, ts_s, GRID_CF_THRESHOLD, sigma_s)
-        freq_solar[i, j] = len(rows_s) / n_winters
-        dur_solar[i, j]  = np.mean([r['duration'] for r in rows_s])
-        sev_solar[i, j]  = np.mean([r['severity_S'] for r in rows_s])
-    else:
-        freq_solar[i, j] = 0; dur_solar[i, j] = 0; sev_solar[i, j] = 0
-
-    # --- Track 3: Blended CF Drought (CF_blend < 0.10) ---
-    mask_b, _, _ = detect_events_1d(ts_b, winter_ok, abs_thr=GRID_CF_THRESHOLD, max_gap=MAX_GAP, min_duration=MIN_DURATION)
-    if mask_b is not None and np.any(mask_b):
-        rows_b = characterize_events_1d(mask_b, ts_b, GRID_CF_THRESHOLD, sigma_b)
-        freq_blend[i, j] = len(rows_b) / n_winters
-        dur_blend[i, j]  = np.mean([r['duration'] for r in rows_b])
-        sev_blend[i, j]  = np.mean([r['severity_S'] for r in rows_b])
-    else:
-        freq_blend[i, j] = 0; dur_blend[i, j] = 0; sev_blend[i, j] = 0
-
-    # --- Track 4: Compound Dunkelflaute (Wind < 0.10 AND Solar < 0.10) ---
-    raw_compound_flag = (ts_w < GRID_CF_THRESHOLD) & (ts_s < GRID_CF_THRESHOLD) & winter_ok
-    mask_c = merge_and_filter_runs_1d(raw_compound_flag, max_gap=MAX_GAP, min_duration=MIN_DURATION)
-    
-    if np.any(mask_c):
-        # Evaluate severity against the Blended CF time series
-        rows_c = characterize_events_1d(mask_c, ts_b, GRID_CF_THRESHOLD, sigma_b)
-        freq_comp[i, j] = len(rows_c) / n_winters
-        dur_comp[i, j]  = np.mean([r['duration'] for r in rows_c])
-        sev_comp[i, j]  = np.mean([r['severity_S'] for r in rows_c])
-    else:
-        freq_comp[i, j] = 0; dur_comp[i, j] = 0; sev_comp[i, j] = 0
-
-# 7. Package into xarray Dataset
-ds_compound = xr.Dataset(
-    {
-        'freq_wind': (['latitude', 'longitude'], freq_wind), 'dur_wind': (['latitude', 'longitude'], dur_wind), 'sev_wind': (['latitude', 'longitude'], sev_wind),
-        'freq_solar':(['latitude', 'longitude'], freq_solar),'dur_solar':(['latitude', 'longitude'], dur_solar),'sev_solar':(['latitude', 'longitude'], sev_solar),
-        'freq_blend':(['latitude', 'longitude'], freq_blend),'dur_blend':(['latitude', 'longitude'], dur_blend),'sev_blend':(['latitude', 'longitude'], sev_blend),
-        'freq_comp': (['latitude', 'longitude'], freq_comp), 'dur_comp': (['latitude', 'longitude'], dur_comp), 'sev_comp': (['latitude', 'longitude'], sev_comp),
-    },
-    coords={'latitude': lats, 'longitude': lons}
-)
-print("12-Panel Compound spatial climatology complete.")
-
-
-#%%
-# Plot: 12-Panel Deconstructed Risk (Frequency, Duration, Severity)
-# 
-
-# Create a 3x4 grid: 3 Metrics (Rows) x 4 Tracks (Columns)
-fig, axes = plt.subplots(3, 4, figsize=(24, 16), subplot_kw={'projection': ccrs.PlateCarree()})
-
-def format_map(ax, title):
-    ax.add_feature(cfeature.OCEAN, facecolor='aliceblue')
-    ax.add_feature(cfeature.LAND, facecolor='whitesmoke')
-    ax.add_feature(cfeature.BORDERS, linewidth=0.5, edgecolor='gray')
-    ax.add_feature(cfeature.COASTLINE, linewidth=0.8, edgecolor='black')
-    ax.set_extent([lons.min(), lons.max(), lats.min(), lats.max()], crs=ccrs.PlateCarree())
-    ax.set_title(title, fontsize=12, pad=10, fontweight='bold')
-    gl = ax.gridlines(draw_labels=False, linewidth=0.5, color='gray', alpha=0.3, linestyle='--')
-
-# Configuration arrays to loop over the 3x4 grid systematically
-tracks = [
-    {'prefix': 'wind',  'col_title': "1. Wind-Only\n(CF < 10%)"},
-    {'prefix': 'solar', 'col_title': "2. Solar-Only\n(CF < 10%)"},
-    {'prefix': 'blend', 'col_title': "3. Blended CF\n(Mix Weighted CF < 10%)"},
-    {'prefix': 'comp',  'col_title': "4. Compound Dunkelflaute\n(Wind AND Solar < 10%)"}
-]
-
-metrics = [
-    {'prefix': 'freq', 'cmap': 'inferno_r', 'label': 'Frequency (Events / Winter)'},
-    {'prefix': 'dur',  'cmap': 'magma_r',   'label': 'Mean Duration (Days)'},
-    {'prefix': 'sev',  'cmap': 'cividis_r', 'label': 'Mean Severity (S)'}
-]
-
-# Generate the 12 panels
-for row_idx, metric in enumerate(metrics):
-    for col_idx, track in enumerate(tracks):
-        
-        ax = axes[row_idx, col_idx]
-        var_name = f"{metric['prefix']}_{track['prefix']}"
-        data = ds_compound[var_name]
-        
-        # Only add the Column titles to the top row
-        title = track['col_title'] if row_idx == 0 else ""
-        format_map(ax, title)
-        
-        # Plot data (letting pcolormesh autoscale to handle the Solar extremes cleanly)
-        im = ax.pcolormesh(lons, lats, data, cmap=metric['cmap'], transform=ccrs.PlateCarree(), shading='auto')
-        
-        # Add colorbars to the bottom of each panel to keep visual spacing clean
-        cbar = plt.colorbar(im, ax=ax, orientation='horizontal', pad=0.04, fraction=0.046)
-        cbar.set_label(metric['label'], fontsize=9)
-        cbar.ax.tick_params(labelsize=8)
-
-fig.suptitle("Deconstructing Meteorological Supply Risks: Frequency, Duration, and Severity", 
-             fontsize=24, fontweight='bold', y=0.97)
-
-# Add Row Labels to the left side of the figure
-fig.text(0.10, 0.81, 'FREQUENCY', va='center', ha='center', rotation='vertical', fontsize=18, fontweight='bold')
-fig.text(0.10, 0.50, 'DURATION',  va='center', ha='center', rotation='vertical', fontsize=18, fontweight='bold')
-fig.text(0.10, 0.22, 'SEVERITY',  va='center', ha='center', rotation='vertical', fontsize=18, fontweight='bold')
-
-# Adjust layout to make room for row labels and main title
-plt.subplots_adjust(left=0.12, right=0.98, top=0.92, bottom=0.05, hspace=0.2, wspace=0.1)
-# plt.tight_layout()
-plt.show()
-
-# Save NetCDF results for manuscript preparation
-ds_compound.to_netcdf(OUT_DIR / 'gridcell_compound_climatology_12panel.nc')
-
-#%%
-# ==============================================================================
-# Figure 5: Dunkelflaute Climatology and Resource Footprint
-# ==============================================================================
-print("Generating Figure 5: Climatology and Resource Footprint...")
-
-# 1. Load EEZ boundaries for the plot
-eez_gdf = gpd.read_file(str(EEZ_SHP))
-eez_eu = eez_gdf[eez_gdf['SOVEREIGN1'].isin(COUNTRIES.keys())]
-
-# 2. Define Geographical Exclusion Masks (Corsica & NW Scottish Islands)
-lon2d, lat2d = np.meshgrid(lons, lats)
-
-# Bounding boxes for exclusion
-corsica = (lon2d >= 8.0) & (lon2d <= 10.0) & (lat2d >= 41.0) & (lat2d <= 43.2)
-hebrides = (lon2d >= -8.0) & (lon2d <= -6.0) & (lat2d >= 56.5) & (lat2d <= 58.5)
-orkney_shetland = (lon2d >= -4.0) & (lon2d <= -0.5) & (lat2d >= 58.5) & (lat2d <= 61.0)
-
-exclusion_mask = corsica | hebrides | orkney_shetland
-
-# 3. Prepare variables and apply exclusion masks
-total_wind_cap = (pot_grid['pot_on'] + pot_grid['pot_off']) / 1000.0 
-total_solar_cap = pot_grid['pot_pv'] / 1000.0
-
-data_wind_cap = np.where(exclusion_mask, np.nan, total_wind_cap.values)
-data_solar_cap = np.where(exclusion_mask, np.nan, total_solar_cap.values)
-data_dur = np.where(exclusion_mask, np.nan, ds_compound['dur_blend'].values)
-data_sev = np.where(exclusion_mask, np.nan, ds_compound['sev_blend'].values)
-
-# 4. Set up the figure layout
-fig, axes = plt.subplots(2, 2, figsize=(16, 14), subplot_kw={'projection': PC})
-axes = axes.flatten()
-
-# Configuration for iterative plotting
-panels = [
-    {
-        'data': data_wind_cap,
-        'title': 'A) Max Installable Wind Capacity',
-        'cmap': 'GnBu',
-        'label': 'Capacity (GW)',
-        'vmax': np.nanpercentile(data_wind_cap[data_wind_cap > 0], 98)
-    },
-    {
-        'data': data_solar_cap,
-        'title': 'B) Max Installable Solar PV Capacity',
-        'cmap': 'YlOrRd',
-        'label': 'Capacity (GW)',
-        'vmax': np.nanpercentile(data_solar_cap[data_solar_cap > 0], 98)
-    },
-    {
-        'data': data_dur,
-        'title': 'C) Compound Dunkelflaute Mean Duration',
-        'cmap': 'magma_r',
-        'label': 'Mean Event Length (Days)',
-        'vmax': np.nanmax(data_dur)
-    },
-    {
-        'data': data_sev,
-        'title': 'D) Compound Dunkelflaute Severity',
-        'cmap': 'cividis_r',
-        'label': 'Standardized Severity (S)',
-        # Cap at 95th percentile to prevent SE France from ruining the scale
-        'vmax': np.nanpercentile(data_sev[data_sev > 0], 95) 
-    }
-]
-
-# 5. Plotting Loop
-for ax, cfg in zip(axes, panels):
-    # Apply standard project map formatting
-    ax.add_feature(cfeature.OCEAN, facecolor='#C6E2F5', zorder=0)
-    ax.add_feature(cfeature.LAND, facecolor='0.93', zorder=0)
-    
-    # EEZ Outlines (Light Blue)
-    ax.add_geometries(
-        eez_eu.geometry, crs=PC, facecolor='none', 
-        edgecolor='#87CEEB', linewidth=0.8, alpha=0.9, zorder=2, linestyle='--'
+    return pd.DataFrame(
+        all_events,
+        columns=EVENT_COLUMNS
     )
-    
-    # Country Borders
-    ax.add_geometries(countries_gdf.geometry, crs=PC, facecolor='none', edgecolor='0.35', lw=0.5, zorder=3)
-    ax.add_feature(cfeature.BORDERS, lw=0.9, edgecolor='0.15', zorder=4)
-    ax.add_feature(cfeature.COASTLINE, lw=0.9, zorder=4)
-    ax.set_extent(DOMAIN_EXTENT, crs=PC)
-    
-    gl = ax.gridlines(draw_labels=True, lw=0.25, color='0.6', alpha=0.5, ls='--')
-    gl.top_labels = False
-    gl.right_labels = False
-    gl.xlabel_style = {'size': 8}
-    gl.ylabel_style = {'size': 8}
-    
-    # Plot Data
-    im = ax.pcolormesh(
-        lons, lats, cfg['data'], 
-        transform=PC, cmap=cfg['cmap'], 
-        vmin=0, vmax=cfg['vmax'], shading='auto', zorder=1
+
+# Build annual supply-side event metrics
+
+def build_annual_supply_metrics(
+        events_df, countries, tracks,
+        thresholds, winters, source_name='CF'):
+    """
+    Calculate annual event metrics for every country, track,
+    threshold setting and winter.
+
+    Winters without events are retained with zero counts and deficits.
+    Mean and maximum event duration remain undefined (NaN).
+    """
+
+    # Columns required from events_supply
+    required_columns = [
+        'country',
+        'track',
+        'source',
+        'threshold_type',
+        'threshold_value',
+        'winter',
+        'duration',
+        'n_low_days',
+        'severity_S',
+        'deficit_sum',
+        'deficit_MWh'
+    ]
+    # Check that all required columns are available
+    missing_columns = [
+        column for column in required_columns
+        if column not in events_df.columns
+    ]
+
+    if missing_columns:
+        raise ValueError(
+            f"Missing required event columns: {missing_columns}"
+        )
+
+    # Container for annual result rows
+    annual_rows = []
+
+    # Loop over every possible analysis combination
+    for code in countries:
+        for track_name in tracks:
+            for threshold_type, threshold_values in thresholds.items():
+                for threshold_value in threshold_values:
+                    for winter in winters:
+
+                        # Select events belonging to this combination
+                        selected = events_df[
+                            (events_df['country'] == code)
+                            & (events_df['track'] == track_name)
+                            & (events_df['source'] == source_name)
+                            & (
+                                events_df['threshold_type']
+                                == threshold_type
+                            )
+                            & np.isclose(
+                                events_df['threshold_value'],
+                                float(threshold_value)
+                            )
+                            & (events_df['winter'] == winter)
+                        ]
+
+                        # Winter without any detected events
+                        if selected.empty:
+
+                            annual_rows.append(dict(
+                                country=code,
+                                track=track_name,
+                                source=source_name,
+                                threshold_type=threshold_type,
+                                threshold_value=float(threshold_value),
+                                winter=int(winter),
+                                n_events=0,
+                                event_days=0,
+                                low_days=0,
+                                mean_duration=np.nan,
+                                max_duration=np.nan,
+                                total_severity_S=0.0,
+                                total_deficit_MWh=0.0,
+                                max_event_deficit_MWh=np.nan,
+                                total_deficit_CF_days=0.0,
+                                max_event_deficit_CF_days=np.nan,
+                            ))
+
+                        # Winter containing one or more events
+                        else:
+
+                            annual_rows.append(dict(
+                                country=code,
+                                track=track_name,
+                                source=source_name,
+                                threshold_type=threshold_type,
+                                threshold_value=float(threshold_value),
+                                winter=int(winter),
+                                n_events=int(len(selected)),
+                                event_days=int(
+                                    selected['duration'].sum()
+                                ),
+                                low_days=int(
+                                    selected['n_low_days'].sum()
+                                ),
+                                mean_duration=float(
+                                    selected['duration'].mean()
+                                ),
+                                max_duration=int(
+                                    selected['duration'].max()
+                                ),
+                                total_severity_S=float(
+                                    selected['severity_S'].sum()
+                                ),
+                                total_deficit_MWh=float(
+                                    selected['deficit_MWh'].sum()
+                                ),
+                                max_event_deficit_MWh=float(
+                                    selected['deficit_MWh'].max()
+                                ),
+                                total_deficit_CF_days=float(
+                                    selected['deficit_sum'].sum()
+                                ),
+                                max_event_deficit_CF_days=float(
+                                    selected['deficit_sum'].max()
+                                ),
+                            ))
+
+    # Convert result rows into one dataframe
+    annual_df = pd.DataFrame(annual_rows)
+
+    # Check that every expected combination was created
+    n_threshold_settings = sum(
+        len(values) for values in thresholds.values()
     )
-    
-    # Colorbar
-    cbar = fig.colorbar(im, ax=ax, orientation='horizontal', pad=0.06, fraction=0.046)
-    cbar.set_label(cfg['label'], fontsize=10, fontweight='bold')
-    cbar.ax.tick_params(labelsize=9)
-    
-    ax.set_title(cfg['title'], fontsize=14, fontweight='bold', pad=12)
 
-plt.subplots_adjust(hspace=0.25, wspace=0.1)
-# save_panel(fig, 'Fig5_Dunkelflaute_Climatology_Updated')
-plt.show()
+    expected_rows = (
+        len(countries)
+        * len(tracks)
+        * n_threshold_settings
+        * len(winters)
+    )
+
+    assert len(annual_df) == expected_rows, \
+        "Annual output does not contain every expected combination"
+
+    return annual_df
 #%%
-# ==============================================================================
-# SE France Anomaly Inspector: Time Series Analysis
-# ==============================================================================
-import matplotlib.pyplot as plt
-import numpy as np
-from scipy.ndimage import label
+# run the event detection and characterization for 3 tracks
+EVENT_COLUMNS = [
+    'country',
+    'track',
+    'source',
+    'threshold_type',
+    'threshold_value',
+    'units',
+    'winter',
+    'start',
+    'end',
+    'duration',
+    'n_low_days',
+    'n_gap_days',
+    'threshold',
+    'min_val',
+    'mean_val',
+    'severity_S',
+    'deficit_sum'
+]
 
-# 1. Define bounding box for SE France / Alpine foothills
-lat_min, lat_max = 43.0, 45.5
-lon_min, lon_max = 5.5, 7.5
+# values for CF thresholds and percentiles for relative events
+ABS_CF_THRESHOLDS = [0.01, 0.05, 0.1, 0.15, 0.2]
+PERCENTILE_THRESHOLDS = [1, 5, 10]
 
-# 2. Extract the gridcell with maximum severity in SE France
-se_france_sev = ds_compound["sev_comp"].where(
-    (ds_compound.latitude >= lat_min)
-    & (ds_compound.latitude <= lat_max)
-    & (ds_compound.longitude >= lon_min)
-    & (ds_compound.longitude <= lon_max),
-    drop=True,
+# Detect and characterize events for all capacity scenarios
+
+thresholds = {
+    'absolute': ABS_CF_THRESHOLDS,
+    'percentile': PERCENTILE_THRESHOLDS,
+}
+
+event_tables = []
+
+for track_name, df in CF_tracks.items():
+    for threshold_type, threshold_values in thresholds.items():
+        for threshold_value in threshold_values:
+
+            detected = run_detection(
+                df,
+                track_name=track_name,
+                source_name='CF',
+                threshold_type=threshold_type,
+                thr_val=threshold_value,
+                value_units='fraction',
+            )
+
+            if not detected.empty:
+                event_tables.append(detected)
+
+events_supply = (
+    pd.concat(event_tables, ignore_index=True)
+    if event_tables
+    else pd.DataFrame(columns=EVENT_COLUMNS)
 )
 
-max_cell = se_france_sev.where(se_france_sev == se_france_sev.max(), drop=True)
-target_lat = float(max_cell.latitude.values[0])
-target_lon = float(max_cell.longitude.values[0])
+#%%
+# Add capacity and generation-unit characteristics
 
+events_supply['capacity_MW'] = pd.Series(
+    [
+        float(track_capacities[track].loc[country])
+        for track, country in zip(
+            events_supply['track'],
+            events_supply['country'],
+        )
+    ],
+    index=events_supply.index,
+    dtype=float,
+)
+
+for cf_column, mw_column in {
+    'threshold': 'threshold_MW',
+    'min_val': 'min_generation_MW',
+    'mean_val': 'mean_generation_MW',
+}.items():
+    events_supply[mw_column] = (
+        events_supply[cf_column].astype(float)
+        * events_supply['capacity_MW']
+    )
+
+events_supply['deficit_MWh'] = (
+    events_supply['deficit_sum'].astype(float)
+    * events_supply['capacity_MW']
+    * 24
+)
+
+events_supply['scenario_year'] = (
+    events_supply['track'].astype(int)
+)
+
+events_supply.to_csv(
+    OUT_DIR / 'DF_supply_events_all.csv',
+    index=False,
+)
+#%%
+# Annual metrics for every country, scenario, threshold and winter
+
+annual_supply = build_annual_supply_metrics(
+    events_df=events_supply,
+    countries=list(COUNTRIES.values()),
+    tracks=list(CF_tracks),
+    thresholds=thresholds,
+    winters=valid_winters,
+    source_name='CF',
+)
+
+annual_supply['scenario_year'] = (
+    annual_supply['track'].astype(int)
+)
+
+annual_supply.to_csv(
+    OUT_DIR / 'DF_supply_annual_all.csv',
+    index=False,
+)
+
+expected_rows = (
+    len(COUNTRIES)
+    * len(CF_tracks)
+    * sum(len(values) for values in thresholds.values())
+    * len(valid_winters)
+)
+
+print(f'Annual rows: {len(annual_supply)}; expected: {expected_rows}')
 print(
-    f"Peak Severity Gridcell in SE France: Lat {target_lat:.2f}°, Lon {target_lon:.2f}°"
-)
-print(f"Standardized Severity (S): {float(max_cell.values[0]):.2f}")
-
-# 3. Extract capacity factor time series for this location
-ts_wind = (
-    CF_wind_dly.sel(latitude=target_lat, longitude=target_lon, method="nearest")
-    .compute()
-    .values
-)
-ts_solar = (
-    CF_solar_dly.sel(latitude=target_lat, longitude=target_lon, method="nearest")
-    .compute()
-    .values
+    annual_supply.groupby('track')[
+        ['n_events', 'event_days', 'total_deficit_MWh']
+    ].mean()
 )
 
-# Technology weights based on max potential at this cell
-p_on = float(
-    pot_grid["pot_on"].sel(
-        latitude=target_lat, longitude=target_lon, method="nearest"
+#%%
+# Country × scenario heatmaps: event days and normalized shortfall
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+threshold_type = 'absolute'
+threshold_value = 0.15
+
+scenario_order = ['2017', '2024', '2030', '2040', '2050']
+country_order = ['FR', 'BE', 'NL', 'DE', 'DK', 'UK', 'IE']
+
+plot_data = annual_supply.loc[
+    annual_supply['source'].eq('CF')
+    & annual_supply['threshold_type'].eq(threshold_type)
+    & np.isclose(
+        annual_supply['threshold_value'],
+        threshold_value
     )
-)
-p_off = float(
-    pot_grid["pot_off"].sel(
-        latitude=target_lat, longitude=target_lon, method="nearest"
-    )
-)
-p_pv = float(
-    pot_grid["pot_pv"].sel(
-        latitude=target_lat, longitude=target_lon, method="nearest"
-    )
-)
-p_tot = p_on + p_off + p_pv
+].copy()
 
-w_wind = (p_on + p_off) / p_tot if p_tot > 0 else 0.5
-w_solar = p_pv / p_tot if p_tot > 0 else 0.5
+if plot_data.empty:
+    raise ValueError('No results match the selected threshold.')
 
-ts_blend = (w_wind * ts_wind) + (w_solar * ts_solar)
+plot_data['track'] = plot_data['track'].astype(str)
 
-# 4. Detect compound events for this specific cell
-raw_compound_flag = (
-    (ts_wind < GRID_CF_THRESHOLD) & (ts_solar < GRID_CF_THRESHOLD) & winter_ok
-)
-evt_mask = merge_and_filter_runs_1d(
-    raw_compound_flag, max_gap=MAX_GAP, min_duration=MIN_DURATION
+summary = (
+    plot_data
+    .groupby(['country', 'track'])[
+        ['event_days', 'total_deficit_CF_days']
+    ]
+    .mean()
 )
 
-# 5. Plot a sample winter season (e.g., Nov 2017 to Mar 2018)
-sample_window = (times >= "2016-11-01") & (times <= "2018-03-31")
-sample_times = times[sample_window]
+panel_settings = [
+    ('event_days', 'Mean event days per winter', '.1f'),
+    (
+        'total_deficit_CF_days',
+        'Mean CF shortfall per winter (CF-days)',
+        '.2f'
+    ),
+]
 
-fig, ax = plt.subplots(figsize=(14, 5))
-
-# Plot Generation Time Series
-ax.plot(
-    sample_times,
-    ts_wind[sample_window],
-    label=f"Wind CF (weight={w_wind:.2f})",
-    color="#1f77b4",
-    lw=1.2,
-    alpha=0.7,
-)
-ax.plot(
-    sample_times,
-    ts_solar[sample_window],
-    label=f"Solar CF (weight={w_solar:.2f})",
-    color="#ff7f0e",
-    lw=1.2,
-    alpha=0.7,
-)
-ax.plot(
-    sample_times,
-    ts_blend[sample_window],
-    label="Blended CF",
-    color="black",
-    lw=2,
+fig, axes = plt.subplots(
+    1, 2,
+    figsize=(10, 5),
+    layout='constrained'
 )
 
-# Threshold Floor Line
-ax.axhline(
-    GRID_CF_THRESHOLD,
-    color="crimson",
-    linestyle="--",
-    lw=1.5,
-    label=f"Threshold ({GRID_CF_THRESHOLD*100:.0f}%)",
-)
+for ax, (metric, title, number_format) in zip(axes, panel_settings):
 
-# Highlight active Dunkelflaute event days
-sample_evt = evt_mask[sample_window]
-lab, num_features = label(sample_evt)
-for k in range(1, num_features + 1):
-    idx = np.where(lab == k)[0]
-    ax.axvspan(
-        sample_times[idx[0]],
-        sample_times[idx[-1]],
-        color="crimson",
-        alpha=0.25,
-        label="Dunkelflaute Event" if k == 1 else "",
+    table = (
+        summary[metric]
+        .unstack('track')
+        .reindex(index=country_order, columns=scenario_order)
     )
 
-ax.set_ylabel("Daily Capacity Factor", fontsize=11)
-ax.set_title(
-    f"Dunkelflaute Dynamics at SE France Gridcell (Lat {target_lat:.2f}°, Lon {target_lon:.2f}°) — Winter 2017/18",
-    fontsize=13,
-    fontweight="bold",
-    pad=12,
-)
-ax.set_ylim(0, max(0.6, np.nanmax(ts_blend[sample_window]) * 1.1))
-ax.grid(True, linestyle="--", alpha=0.4)
-ax.legend(loc="upper right", frameon=True)
+    if table.isna().any().any():
+        raise ValueError(f'Missing country–scenario means for {metric}.')
 
-plt.tight_layout()
+    values = table.to_numpy()
+    vmax = max(float(values.max()), 1e-12)
+
+    image = ax.imshow(
+        values,
+        cmap='YlOrRd',
+        vmin=0,
+        vmax=vmax,
+        aspect='auto'
+    )
+
+    for row, column in np.ndindex(values.shape):
+        value = values[row, column]
+
+        ax.text(
+            column, row,
+            format(value, number_format),
+            ha='center',
+            va='center',
+            fontsize=10,
+            color='white' if value > 0.65 * vmax else '#222222'
+        )
+
+    ax.set(
+        xticks=range(len(scenario_order)),
+        xticklabels=scenario_order,
+        yticks=range(len(country_order)),
+        yticklabels=country_order,
+        xlabel='Installed-capacity scenario year',
+        title=title
+    )
+
+    fig.colorbar(image, ax=ax, shrink=0.8, pad=0.02)
+
+axes[0].set_ylabel('Country')
+
+threshold_label = (
+    f'Fleet CF threshold: {threshold_value:.0%}'
+    if threshold_type == 'absolute'
+    else f'Winter CF percentile: {threshold_value:g}'
+)
+
+fig.suptitle(
+    f'Supply-drought characteristics | {threshold_label}',
+    fontsize=14
+)
+
+# Optional export:
+# fig.savefig(
+#     FIG_DIR / 'DF_supply_scenario_heatmaps.pdf',
+#     bbox_inches='tight'
+# )
+
+plt.show()
+
+#%%
+# Event-duration sensitivity to CF threshold, by country and scenario
+
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+from matplotlib.ticker import PercentFormatter
+
+threshold_values = [0.01, 0.05, 0.10, 0.15, 0.20]
+scenario_order = ['2017', '2024', '2030', '2040', '2050']
+country_order = ['FR', 'BE', 'NL', 'DE', 'DK', 'GB', 'IE']
+
+scenario_colours = {
+    '2017': '#3366AA',
+    '2024': '#009E73',
+    '2030': '#E69F00',
+    '2040': '#D55E00',
+    '2050': '#8A508F',
+}
+
+scenario_markers = {
+    '2017': 'o',
+    '2024': 's',
+    '2030': '^',
+    '2040': 'D',
+    '2050': 'P',
+}
+
+plot_data = annual_supply.loc[
+    annual_supply['source'].eq('CF')
+    & annual_supply['threshold_type'].eq('absolute')
+].copy()
+
+plot_data['track'] = plot_data['track'].astype(str)
+
+fig, axes = plt.subplots(
+    2, 4,
+    figsize=(15, 8),
+    sharex=True,
+    sharey=True,
+    layout='constrained'
+)
+
+axes = axes.ravel()
+
+for ax, country in zip(axes, country_order):
+
+    for scenario in scenario_order:
+
+        means, lower, upper = [], [], []
+
+        for threshold in threshold_values:
+
+            selected = plot_data.loc[
+                plot_data['country'].eq(country)
+                & plot_data['track'].eq(scenario)
+                & np.isclose(
+                    plot_data['threshold_value'],
+                    threshold
+                ),
+                'event_days'
+            ]
+
+            if selected.empty:
+                raise ValueError(
+                    f'Missing annual rows: {country}, '
+                    f'{scenario}, threshold {threshold}.'
+                )
+
+
+            # Include every winter, including winters with zero event days.
+            means.append(selected.mean())
+            lower.append(selected.quantile(0.10))
+            upper.append(selected.quantile(0.90))
+
+        means = np.asarray(means, dtype=float)
+        lower = np.asarray(lower, dtype=float)
+        upper = np.asarray(upper, dtype=float)
+
+        # Thresholds with no events in any winter remain NaN.
+        ax.fill_between(
+            threshold_values,
+            lower,
+            upper,
+            color=scenario_colours[scenario],
+            alpha=0.12,
+            linewidth=0
+        )
+
+        ax.plot(
+            threshold_values,
+            means,
+            color=scenario_colours[scenario],
+            marker=scenario_markers[scenario],
+            markersize=5,
+            linewidth=2
+        )
+
+    ax.set_title(country)
+    ax.set_xlabel('Fleet CF threshold')
+    ax.set_ylabel('Event days per winter')
+    ax.set_xticks(threshold_values)
+    ax.xaxis.set_major_formatter(
+        PercentFormatter(xmax=1, decimals=0)
+    )
+    ax.tick_params(axis='x', labelbottom=True)
+    ax.set_ylim(bottom=0)
+    ax.grid(alpha=0.2)
+
+# Shared legend in the unused eighth panel
+axes[-1].axis('off')
+
+handles = [
+    Line2D(
+        [], [],
+        color=scenario_colours[scenario],
+        marker=scenario_markers[scenario],
+        linewidth=2,
+        label=scenario
+    )
+    for scenario in scenario_order
+]
+
+axes[-1].legend(
+    handles=handles,
+    title='Capacity scenario',
+    loc='upper left',
+    frameon=False
+)
+
+axes[-1].text(
+    0, 0.08,
+    'Lines: mean event days per winter\n'
+    'Shading: 10th–90th percentiles\n'
+    'across all historical winters\n\n'
+    'Zero-event winters included;\n'
+    'event days include pooled gap days.',
+    transform=axes[-1].transAxes,
+    fontsize=10
+)
+
+fig.suptitle(
+    'Mean event days per winter: sensitivity to CF threshold',
+    fontsize=15
+)
+# Optional export:
+# fig.savefig(
+#     FIG_DIR / 'DF_supply_duration_CF_threshold_sensitivity.pdf',
+#     bbox_inches='tight'
+# )
+
+plt.show()
+
+#%%
+# Probability of at least one event exceeding a duration per winter
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.colors import Normalize, TwoSlopeNorm
+
+# -------------------------------------------------------------
+# Settings
+# -------------------------------------------------------------
+country_order = ['FR', 'BE', 'NL', 'DE', 'DK', 'GB', 'IE']
+scenario_order = ['2017', '2024', '2030', '2040', '2050']
+
+cf_thresholds = [0.01, 0.05, 0.10, 0.15, 0.20]
+duration_thresholds = np.array([3, 5, 7, 10, 14, 21])
+
+baseline = '2017'
+comparison_scenarios = ['2030', '2050']
+
+# Use a subset here for a smaller initial figure, e.g. ['DK', 'FR', 'DE']
+plot_countries = country_order
+
+# -------------------------------------------------------------
+# Prepare the annual results
+# -------------------------------------------------------------
+data = annual_supply.loc[
+    annual_supply['source'].eq('CF')
+    & annual_supply['threshold_type'].eq('absolute')
+].copy()
+
+data['track'] = data['track'].astype(str)
+
+# Common historical winters: all scenarios must use the same sample
+winter_order = np.sort(data['winter'].unique())
+n_winters = len(winter_order)
+
+if n_winters == 0:
+    raise ValueError('No winter results were found.')
+
+# -------------------------------------------------------------
+# Calculate empirical probabilities
+# -------------------------------------------------------------
+probability_rows = []
+
+for country in country_order:
+    for scenario in scenario_order:
+        for threshold in cf_thresholds:
+
+            selected = data.loc[
+                data['country'].eq(country)
+                & data['track'].eq(scenario)
+                & np.isclose(data['threshold_value'], threshold)
+            ].copy()
+
+            if selected['winter'].duplicated().any():
+                raise ValueError(
+                    f'Duplicate winters: {country}, {scenario}, {threshold}'
+                )
+
+            selected = (
+                selected
+                .set_index('winter')
+                .reindex(winter_order)
+            )
+
+            # Missing annual rows must not become zero-event winters
+            if selected['n_events'].isna().any():
+                raise ValueError(
+                    f'Missing winter results: '
+                    f'{country}, {scenario}, {threshold}'
+                )
+
+            has_events = selected['n_events'].gt(0)
+
+            if selected.loc[has_events, 'max_duration'].isna().any():
+                raise ValueError(
+                    f'Missing duration for a winter containing events: '
+                    f'{country}, {scenario}, {threshold}'
+                )
+
+            # Zero is used only as an indicator that no event occurred.
+            # It does not replace undefined mean event durations.
+            longest_event = selected['max_duration'].where(
+                has_events, 0
+            ).to_numpy(dtype=float)
+
+            for duration in duration_thresholds:
+
+                qualifying_winters = int(
+                    np.count_nonzero(longest_event >= duration)
+                )
+
+                probability_rows.append({
+                    'country': country,
+                    'track': scenario,
+                    'CF_threshold': threshold,
+                    'minimum_duration': int(duration),
+                    'qualifying_winters': qualifying_winters,
+                    'n_winters': n_winters,
+                    'probability': qualifying_winters / n_winters,
+                })
+
+duration_probabilities = pd.DataFrame(probability_rows)
+
+# -------------------------------------------------------------
+# Helper: turn one country/scenario into a plotting matrix
+# -------------------------------------------------------------
+def probability_matrix(country, scenario):
+
+    return (
+        duration_probabilities.loc[
+            duration_probabilities['country'].eq(country)
+            & duration_probabilities['track'].eq(scenario)
+        ]
+        .pivot(
+            index='CF_threshold',
+            columns='minimum_duration',
+            values='probability'
+        )
+        .reindex(
+            index=cf_thresholds,
+            columns=duration_thresholds
+        )
+        .to_numpy()
+        * 100
+    )
+
+baseline_matrices = {
+    country: probability_matrix(country, baseline)
+    for country in plot_countries
+}
+
+change_matrices = {
+    (country, scenario):
+        probability_matrix(country, scenario)
+        - baseline_matrices[country]
+    for country in plot_countries
+    for scenario in comparison_scenarios
+}
+
+# Common scales across all countries
+probability_norm = Normalize(vmin=0, vmax=100)
+
+change_limit = max(
+    1.0,
+    max(np.abs(matrix).max() for matrix in change_matrices.values())
+)
+
+change_norm = TwoSlopeNorm(
+    vmin=-change_limit,
+    vcenter=0,
+    vmax=change_limit
+)
+
+# -------------------------------------------------------------
+# Plot baseline probabilities and scenario changes
+# -------------------------------------------------------------
+n_columns = 1 + len(comparison_scenarios)
+
+fig, axes = plt.subplots(
+    len(plot_countries),
+    n_columns,
+    figsize=(4.2 * n_columns, 2.35 * len(plot_countries)),
+    squeeze=False,
+    layout='constrained'
+)
+
+for row, country in enumerate(plot_countries):
+
+    matrices = [baseline_matrices[country]] + [
+        change_matrices[(country, scenario)]
+        for scenario in comparison_scenarios
+    ]
+
+    for column, matrix in enumerate(matrices):
+
+        ax = axes[row, column]
+        is_baseline = column == 0
+
+        image = ax.imshow(
+            matrix,
+            origin='lower',
+            aspect='auto',
+            interpolation='nearest',
+            cmap='YlOrRd' if is_baseline else 'RdBu_r',
+            norm=probability_norm if is_baseline else change_norm
+        )
+
+        if is_baseline:
+            probability_image = image
+        else:
+            change_image = image
+
+        ax.set_xticks(range(len(duration_thresholds)))
+        ax.set_xticklabels(duration_thresholds)
+
+        ax.set_yticks(range(len(cf_thresholds)))
+        ax.set_yticklabels([f'{q:.0%}' for q in cf_thresholds])
+
+        ax.set_title(country, loc='left', fontsize=11)
+
+        if column == 0:
+            ax.set_ylabel('Fleet CF threshold')
+
+        if row == len(plot_countries) - 1:
+            ax.set_xlabel('Minimum event duration (days)')
+
+        if row == 0:
+            heading = (
+                f'{baseline}: probability'
+                if is_baseline
+                else f'{comparison_scenarios[column - 1]} − {baseline}'
+            )
+            ax.set_title(heading, loc='center', fontsize=11)
+
+fig.colorbar(
+    probability_image,
+    ax=list(axes[:, 0]),
+    label='Winters with ≥1 qualifying event (%)',
+    shrink=0.85,
+    pad=0.02
+)
+
+fig.colorbar(
+    change_image,
+    ax=list(axes[:, 1:].ravel()),
+    label='Change in probability (percentage points)',
+    shrink=0.85,
+    pad=0.02
+)
+
+fig.suptitle(
+    'Winter probability of prolonged renewable-production droughts\n'
+    f'{n_winters} historical winters; identical weather across capacity scenarios',
+    fontsize=14
+)
+
+# Optional exports:
+# duration_probabilities.to_csv(
+#     OUT_DIR / 'DF_supply_duration_probabilities.csv',
+#     index=False
+# )
+# fig.savefig(
+#     FIG_DIR / 'DF_supply_duration_threshold_probabilities.pdf',
+#     bbox_inches='tight'
+# )
+
 plt.show()
 #%%
-# Save Outputs for Residual Load Pipeline
+# Maximum winter event duration: exceedance curves by country
 
-# Save the country-level generation time series
-cf_irena_rel_df.to_parquet(OUT_DIR / 'cf_irena_relative.parquet')
-cf_pot_rel_df.to_parquet(OUT_DIR / 'cf_pot_relative.parquet')
-capgen_pot_df.to_parquet(OUT_DIR / 'capgen_pot_absolute.parquet')
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+from matplotlib.ticker import PercentFormatter, MaxNLocator
 
-# Save the event catalogues
-master_events_df.to_parquet(OUT_DIR / 'df_supply_events.parquet')
-annual_df.to_parquet(OUT_DIR / 'df_supply_annual.parquet')
+capacity_scenario = '2024'
+threshold_values = [0.05, 0.10, 0.15]
 
-print(f"\nAll data successfully exported to: {OUT_DIR}")
-# %%
+country_order = ['FR', 'BE', 'NL', 'DE', 'DK', 'GB', 'IE']
+
+country_colours = {
+    'FR': '#0072B2',
+    'BE': '#E69F00',
+    'NL': '#009E73',
+    'DE': '#D55E00',
+    'DK': '#CC79A7',
+    'GB': '#222222',
+    'IE': '#56B4E9',
+}
+
+country_styles = {
+    'FR': '-', 'BE': '--', 'NL': '-.',
+    'DE': '-', 'DK': '--', 'GB': '-', 'IE': ':',
+}
+
+data = annual_supply.loc[
+    annual_supply['source'].eq('CF')
+    & annual_supply['threshold_type'].eq('absolute')
+].copy()
+
+data['track'] = data['track'].astype(str)
+winter_order = np.sort(np.asarray(valid_winters))
+n_winters = len(winter_order)
+
+if n_winters == 0:
+    raise ValueError('No valid winters were found.')
+
+# Gather maximum durations, preserving zero-event winters
+maximum_durations = {}
+
+for country in country_order:
+    for threshold in threshold_values:
+
+        selected = data.loc[
+            data['country'].eq(country)
+            & data['track'].eq(capacity_scenario)
+            & np.isclose(data['threshold_value'], threshold)
+        ]
+
+        if selected['winter'].duplicated().any():
+            raise ValueError(
+                f'Duplicate winters: {country}, {threshold}'
+            )
+
+        selected = (
+            selected.set_index('winter')
+            .reindex(winter_order)
+        )
+
+        if selected['n_events'].isna().any():
+            raise ValueError(
+                f'Missing annual results: {country}, {threshold}'
+            )
+
+        has_events = selected['n_events'].gt(0)
+
+        # Zero here means no event occurred in that winter.
+        longest = selected['max_duration'].where(
+            has_events, 0
+        ).to_numpy(dtype=float)
+
+        if not np.isfinite(longest).all():
+            raise ValueError(
+                f'Missing event duration: {country}, {threshold}'
+            )
+
+        maximum_durations[(country, threshold)] = longest
+
+# Start at your minimum retained event duration.
+# Extend one day beyond the observed maximum to show the zero endpoint.
+largest_event = max(
+    values.max() for values in maximum_durations.values()
+)
+
+duration_grid = np.arange(
+    MIN_DURATION,
+    max(MIN_DURATION + 1, int(np.ceil(largest_event)) + 1) + 1
+)
+
+fig, axes = plt.subplots(
+    1, len(threshold_values),
+    figsize=(14, 4.8),
+    sharex=True,
+    sharey=True
+)
+
+axes = np.atleast_1d(axes)
+
+for ax, threshold in zip(axes, threshold_values):
+
+    for country in country_order:
+
+        longest = maximum_durations[(country, threshold)]
+
+        probability = (
+            longest[:, None] >= duration_grid[None, :]
+        ).mean(axis=0)
+
+        ax.step(
+            duration_grid,
+            probability,
+            where='pre',
+            color=country_colours[country],
+            linestyle=country_styles[country],
+            linewidth=2,
+            label=country
+        )
+
+    ax.set_title(f'Fleet CF threshold: {threshold:.0%}')
+    ax.set_xlabel('Minimum event duration (days)')
+    ax.set_xlim(duration_grid[0], duration_grid[-1])
+    ax.set_ylim(0, 1.02)
+    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+    ax.yaxis.set_major_formatter(PercentFormatter(1))
+    ax.grid(alpha=0.2)
+
+axes[0].set_ylabel(
+    'Winters with at least one event\n'
+    'of this duration or longer'
+)
+
+handles = [
+    Line2D(
+        [], [],
+        color=country_colours[country],
+        linestyle=country_styles[country],
+        linewidth=2,
+        label=country
+    )
+    for country in country_order
+]
+
+fig.legend(
+    handles=handles,
+    loc='lower center',
+    bbox_to_anchor=(0.5, 0.045),
+    ncol=len(country_order),
+    frameon=False
+)
+
+fig.suptitle(
+    f'Winter drought-duration exceedance | {capacity_scenario} capacity scenario',
+    fontsize=14
+)
+
+fig.text(
+    0.5, 0.01,
+    f'{n_winters} historical winters; no-event winters included. '
+    'Durations include pooled gap days.',
+    ha='center',
+    fontsize=10
+)
+
+fig.tight_layout(rect=[0, 0.15, 1, 0.92])
+
+# Optional export:
+# fig.savefig(
+#     FIG_DIR / f'DF_duration_exceedance_{capacity_scenario}.pdf',
+#     bbox_inches='tight'
+# )
+
+plt.show()

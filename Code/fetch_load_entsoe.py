@@ -1,62 +1,83 @@
 #%%
-# fetch_entsoe_load.py — run once; writes ./../Data/entsoe_load/load_{CODE}.parquet
-import os, pandas as pd, time
+# Fetch national load and save daily mean MW.
+# Run from dunkelflaute/Code.
+
 from pathlib import Path
+import time
+import pandas as pd
 from entsoe import EntsoePandasClient
 
-# access token for ENTSOE API
-os.environ["ENTSOE_API"] = Path.home().joinpath(".entsoe_token").read_text().strip()
+client = EntsoePandasClient(
+    api_key=Path.home().joinpath(".entsoe_token").read_text().strip(),
+    timeout=60,
+)
 
+COUNTRIES = ["FR", "BE", "NL", "DE", "UK", "IE", "DK"]
+START_YEAR = 2015
+END_YEAR = 2019  # Inclusive; use 2019 for the calibration period only.
 
-#%%
-client = EntsoePandasClient(api_key=os.environ["ENTSOE_API"])   # your security token
-ZONES = {
-    "FR":  ("FR",      "Europe/Paris",      2015),
-    "BE":  ("BE",      "Europe/Brussels",   2015),
-    "NL":  ("NL",      "Europe/Amsterdam",  2015),
-    "DE":  ("DE_LU",   "Europe/Berlin",     2015),   # falls back to DE_AT_LU pre-2018
-    "GB":  ("GB",      "Europe/London",     2015),
-    "IE":  ("IE_SEM",  "Europe/Dublin",     2017),   # SEM data thin before 2017
-    "DK":  ("DK",      "Europe/Copenhagen", 2015),
-}
-out = Path("./../Data/entsoe_load"); out.mkdir(parents=True, exist_ok=True)
+OUT = Path("../Data/entsoe_load")
+OUT.mkdir(parents=True, exist_ok=True)
 
 #%%
-def fetch_one(zone_code, tz, start_yr):
+def fetch_one(code):
     chunks = []
-    for yr in range(start_yr, 2024):
-        s = pd.Timestamp(f"{yr}0101", tz=tz)
-        e = pd.Timestamp(f"{yr+1}0101", tz=tz)
-        try:
-            raw = client.query_load(zone_code, start=s, end=e)
-        except Exception as ex:
-            # Germany: try old zone code for pre-2018 years
-            if zone_code == "DE_LU" and yr < 2019:
-                try:
-                    raw = client.query_load("DE_AT_LU", start=s, end=e)
-                except Exception as ex2:
-                    print(f"  {zone_code} {yr}: {ex2}"); continue
-            else:
-                print(f"  {zone_code} {yr}: {ex}"); continue
-        # result is a Series or a DataFrame (DK sometimes returns two columns)
+
+    for year in range(START_YEAR, END_YEAR + 1):
+        start = pd.Timestamp(f"{year}-01-01", tz="UTC")
+        end = pd.Timestamp(f"{year + 1}-01-01", tz="UTC")
+
+        # Let errors stop execution rather than save a silently incomplete file.
+        raw = client.query_load(code, start=start, end=end)
+
         if isinstance(raw, pd.DataFrame):
-            raw = raw.sum(axis=1)           # DK: sum DK1 + DK2
-        raw.name = "load"
+            raw = raw["Actual Load"]
+
+        raw = raw.tz_convert("UTC").sort_index()
+        raw = raw.loc[(raw.index >= start) & (raw.index < end)]
+
+        if raw.empty:
+            raise ValueError(f"{code}: no data returned for {year}")
+
         chunks.append(raw)
-        time.sleep(0.5)                   
-    if not chunks:
-        print(f"  {zone_code}: no data retrieved"); return
-    s = pd.concat(chunks).sort_index()
-    s.index = s.index.tz_localize(None)     # strip tz for uniform storage
-    daily = s.resample("1D").mean().rename("load")
-    daily.to_frame().to_parquet(out / f"load_{short}.parquet")
-    print(f"  {short}: {len(daily)} days, "
-          f"{daily.index[0].date()} → {daily.index[-1].date()}, "
-          f"mean={daily.mean():.0f} MW")
+        print(f"  {code} {year}: {raw.notna().sum():,} valid observations")
+        time.sleep(0.5)
 
-for short, (zone_code, tz, start_yr) in ZONES.items():
-    print(f"\nFetching {short} ({zone_code})...")
-    fetch_one(zone_code, tz, start_yr)
+    load = pd.concat(chunks).sort_index()
 
-print("\nDone.")
-# %%
+    if load.index.has_duplicates:
+        raise ValueError(f"{code}: duplicate timestamps need inspection")
+
+    daily = load.resample("1D").mean().rename("load")
+
+    # Preserve missing days, including gaps at the record boundaries.
+    dates = pd.date_range(
+        f"{START_YEAR}-01-01",
+        f"{END_YEAR + 1}-01-01",
+        freq="D",
+        inclusive="left",
+        tz="UTC",
+    )
+    daily = daily.reindex(dates)
+
+    # Remove timezone only AFTER aggregation into UTC days.
+    daily.index = daily.index.tz_localize(None)
+    daily.index.name = "date"
+
+    path = OUT / f"load_{code}.parquet"
+    daily.to_frame().to_parquet(path)
+
+    print(
+        f"Saved {path.name}: {len(daily):,} days, "
+        f"{daily.isna().sum()} missing days, "
+        f"mean={daily.mean():,.0f} MW\n"
+    )
+
+
+#%%
+
+for code in COUNTRIES:
+    print(f"Fetching {code}...")
+    fetch_one(code)
+
+print("Done.")
